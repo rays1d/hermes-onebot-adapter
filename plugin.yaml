@@ -1,0 +1,74 @@
+name: onebot-platform
+label: OneBot (QQ)
+kind: platform
+version: 0.1.0
+description: >
+  OneBot 11 (QQ) gateway adapter for Hermes Agent. Runs a reverse-WebSocket
+  server (default 0.0.0.0:8643) that any OneBot 11 implementation — NapCat,
+  LLOneBot, Lagrange, go-cqhttp — dials into with a Universal connection
+  (events + API over one socket), and relays messages between QQ private
+  chats/groups and the Hermes agent. Inbound rich media is surfaced as
+  inline markers (e.g. `[图片:m1]`) the agent resolves on demand via the
+  `napcat_call` tool (get_image/get_record/get_file); outbound media is
+  streamed with `upload_file_stream` (NapCat v4.8.115+) and falls back to
+  base64. Designed for cross-machine deployments (e.g. over an EasyTier
+  mesh): no `file://` shortcuts, every media path is URL/stream based.
+author: hermes-projects
+requires_env:
+  - name: ONEBOT_TOKEN
+    description: "Shared secret authenticating the OneBot implementation's reverse-WS dial-in (Authorization: Bearer or ?access_token=) — must match the access token of the WebSocket-client item configured in NapCat (or the equivalent in other OneBot implementations)"
+    prompt: "OneBot access token"
+    password: true
+optional_env:
+  - name: ONEBOT_HOST
+    description: "Reverse-WebSocket bind host (default 0.0.0.0; set to your EasyTier/tailscale interface IP to keep the listener off the LAN)"
+    prompt: "WS bind host (default 0.0.0.0)"
+    password: false
+  - name: ONEBOT_PORT
+    description: "Reverse-WebSocket listen port the OneBot implementation dials into (default 8643, the community-standard reverse-WS port)"
+    prompt: "Reverse WS port (default 8643)"
+    password: false
+  - name: ONEBOT_PATH
+    description: "Reverse-WebSocket URL path (default /onebot/ws) — must match the URL configured on the NapCat WebSocket-client item"
+    prompt: "WS path (default /onebot/ws)"
+    password: false
+  - name: ONEBOT_HTTP_URL
+    description: "Base URL of the OneBot implementation's HTTP API (e.g. http://100.x.x.x:3000) — required only for standalone / cron delivery, which runs outside the gateway process and cannot reuse the WS connection"
+    prompt: "OneBot HTTP API base URL (optional)"
+    password: false
+  - name: ONEBOT_HOME_CHANNEL
+    description: "Chat ID for cron / notification delivery: a plain QQ number (private) or group:<group_id> (group chat)"
+    prompt: "Home channel (optional)"
+    password: false
+  - name: ONEBOT_DM_POLICY
+    description: "Private-chat policy: allowlist (default, only ONEBOT_ALLOWED_USERS may DM), open (anyone), or disabled (ignore DMs entirely)"
+    prompt: "DM policy: allowlist/open/disabled (default allowlist)"
+    password: false
+  - name: ONEBOT_GROUP_POLICY
+    description: "Group-chat policy: allowlist (default, only groups in ONEBOT_ALLOWED_GROUPS), open (any group), or disabled (ignore groups entirely)"
+    prompt: "Group policy: allowlist/open/disabled (default allowlist)"
+    password: false
+  - name: ONEBOT_ALLOWED_USERS
+    description: "Comma-separated QQ numbers allowed to DM the bot under the allowlist DM policy (empty + allowlist = all DMs rejected until configured)"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: ONEBOT_GROUP_ALLOWED_USERS
+    description: "Comma-separated QQ numbers allowed to address the bot inside allowed groups (empty = every member of an allowed group)"
+    prompt: "Allowed group users (comma-separated)"
+    password: false
+  - name: ONEBOT_ALLOWED_GROUPS
+    description: "Comma-separated group IDs whose members may interact with the bot (required non-empty under the default allowlist group policy)"
+    prompt: "Allowed groups (comma-separated)"
+    password: false
+  - name: ONEBOT_ADMIN_USERS
+    description: "Comma-separated QQ numbers granted the admin tier — unlocks dangerous napcat_call actions such as group management"
+    prompt: "Admin users (comma-separated)"
+    password: false
+  - name: ONEBOT_ALLOW_ALL_USERS
+    description: "One-switch override that skips every adapter allowlist (and the gateway-level user gate) — fail-open, only for trusted personal deployments"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ONEBOT_MAX_MSG_CHARS
+    description: "Outbound messages longer than this many characters are split at sentence boundaries (default 2000)"
+    prompt: "Max chars per outbound message (default 2000)"
+    password: false
