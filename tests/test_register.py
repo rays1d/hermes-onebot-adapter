@@ -1,0 +1,402 @@
+"""test_register.py — 插件注册契约与工具层（不依赖 WS 的单元断言）。
+
+覆盖：validate_config/is_connected（token 三处拼写）、env_enablement_fn 种子、
+apply_yaml_bridge（YAML→env，env 优先不改写）、register() 对 mock ctx 的
+全参数断言、onebot_call 白名单/管理员档/media_id 桥接。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import MagicMock
+
+
+import onebot_plugin as plugin
+from conftest import fake_live_adapter
+from gateway.config import PlatformConfig
+from onebot_plugin import tools
+from onebot_plugin.adapter import (
+    NetworkError,
+    OneBotApiError,
+    OnebotAdapter,
+    check_onebot_requirements,
+)
+from onebot_plugin.formatting import QQ_TEXT_LIMIT
+from onebot_plugin.segments import MediaRegistry
+from onebot_plugin.standalone import _standalone_send
+
+
+def asyncio_run(coro):
+    return asyncio.run(coro)
+
+
+def _handler_result(payload: str) -> dict:
+    return json.loads(payload)
+
+
+# ---------------------------------------------------------------------------
+# validate_config / is_connected（token 三处拼写）
+# ---------------------------------------------------------------------------
+
+class TestValidateConfig:
+    def test_token_in_extra(self):
+        assert plugin.validate_config(
+            PlatformConfig(enabled=True, extra={"token": "t"})) is True
+
+    def test_token_typed_key(self):
+        assert plugin.validate_config(PlatformConfig(enabled=True, token="t")) is True
+
+    def test_token_in_scoped_env(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_TOKEN", "env-tok")
+        assert plugin.validate_config(PlatformConfig(enabled=True)) is True
+
+    def test_missing_token_fails(self, monkeypatch):
+        monkeypatch.delenv("ONEBOT_TOKEN", raising=False)
+        assert plugin.validate_config(PlatformConfig(enabled=True)) is False
+
+    def test_blank_token_fails(self):
+        assert plugin.validate_config(
+            PlatformConfig(enabled=True, extra={"token": "  "})) is False
+
+    def test_is_connected_mirrors_validate(self, monkeypatch):
+        monkeypatch.delenv("ONEBOT_TOKEN", raising=False)
+        assert plugin.is_connected(PlatformConfig(enabled=True)) is False
+        monkeypatch.setenv("ONEBOT_TOKEN", "env-tok")
+        assert plugin.is_connected(PlatformConfig(enabled=True)) is True
+
+
+# ---------------------------------------------------------------------------
+# env_enablement_fn
+# ---------------------------------------------------------------------------
+
+class TestEnvEnablement:
+    def test_no_token_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ONEBOT_TOKEN", raising=False)
+        assert plugin._env_enablement() is None
+
+    def test_token_enables_and_seeds_host_port_path(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_TOKEN", "tok")
+        monkeypatch.setenv("ONEBOT_HOST", "10.0.0.5")
+        monkeypatch.setenv("ONEBOT_PORT", "9000")
+        monkeypatch.setenv("ONEBOT_PATH", "ob/ws")  # 无前导斜杠原样种子
+        monkeypatch.setenv("ONEBOT_HTTP_URL", "http://10.0.0.5:3000")
+        seed = plugin._env_enablement()
+        assert seed == {
+            "token": "tok", "host": "10.0.0.5", "port": 9000,
+            "path": "ob/ws", "http_url": "http://10.0.0.5:3000",
+        }
+        assert isinstance(seed["port"], int)  # conv=int
+
+    def test_home_channel_seeded(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_TOKEN", "tok")
+        monkeypatch.setenv("ONEBOT_HOME_CHANNEL", "10086")
+        seed = plugin._env_enablement()
+        assert seed["home_channel"] == {"chat_id": "10086", "name": "Home"}
+
+    def test_home_channel_name_override(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_TOKEN", "tok")
+        monkeypatch.setenv("ONEBOT_HOME_CHANNEL", "group:123")
+        monkeypatch.setenv("ONEBOT_HOME_CHANNEL_NAME", "小助手")
+        seed = plugin._env_enablement()
+        assert seed["home_channel"] == {"chat_id": "group:123", "name": "小助手"}
+
+    def test_bad_port_skipped(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_TOKEN", "tok")
+        monkeypatch.setenv("ONEBOT_PORT", "not-a-number")
+        seed = plugin._env_enablement()
+        assert "port" not in seed
+
+
+# ---------------------------------------------------------------------------
+# apply_yaml_config_fn（YAML→env 桥接，env 优先不改写）
+# ---------------------------------------------------------------------------
+
+class TestApplyYamlBridge:
+    def test_yaml_values_bridged_to_env_and_extra(self, monkeypatch):
+        for name in ("ONEBOT_TOKEN", "ONEBOT_PORT", "ONEBOT_DM_POLICY",
+                     "ONEBOT_ALLOWED_GROUPS"):
+            monkeypatch.delenv(name, raising=False)
+        platform_cfg = {"token": "yaml-tok", "port": 9001, "dm_policy": "open",
+                        "allowed_groups": "123,456"}
+        seeded = plugin._apply_yaml_config({}, platform_cfg)
+        assert seeded == platform_cfg  # 原值进 extra
+        import os
+        assert os.environ["ONEBOT_TOKEN"] == "yaml-tok"
+        assert os.environ["ONEBOT_PORT"] == "9001"
+        assert os.environ["ONEBOT_DM_POLICY"] == "open"
+        assert os.environ["ONEBOT_ALLOWED_GROUPS"] == "123,456"
+
+    def test_env_wins_not_overwritten(self, monkeypatch):
+        monkeypatch.setenv("ONEBOT_DM_POLICY", "allowlist")
+        monkeypatch.setenv("ONEBOT_PORT", "8643")
+        seeded = plugin._apply_yaml_config({}, {"dm_policy": "open", "port": 9001})
+        import os
+        assert os.environ["ONEBOT_DM_POLICY"] == "allowlist"  # env 未被改写
+        assert os.environ["ONEBOT_PORT"] == "8643"
+        assert seeded["dm_policy"] == "open"  # 种子仍携带 YAML 值
+
+    def test_empty_platform_cfg_returns_none(self):
+        assert plugin._apply_yaml_config({}, {}) is None
+
+    def test_yaml_table_covers_all_documented_keys(self):
+        documented = {
+            "token", "host", "port", "path", "http_url", "dm_policy",
+            "group_policy", "allowed_users", "group_allowed_users",
+            "allowed_groups", "admin_users", "allow_all", "max_msg_chars",
+        }
+        assert {row[0] for row in plugin.YAML_TABLE} == documented
+
+
+# ---------------------------------------------------------------------------
+# register(ctx) 全参数契约
+# ---------------------------------------------------------------------------
+
+class TestRegister:
+    def test_register_platform_full_contract(self):
+        ctx = MagicMock()
+        plugin.register(ctx)
+        ctx.register_platform.assert_called_once()
+        kwargs = ctx.register_platform.call_args.kwargs
+        assert kwargs["name"] == "onebot"
+        assert kwargs["label"] == "OneBot (QQ)"
+        assert callable(kwargs["adapter_factory"])
+        assert kwargs["check_fn"] is check_onebot_requirements
+        assert kwargs["validate_config"] is plugin.validate_config
+        assert kwargs["required_env"] == ["ONEBOT_TOKEN"]
+        assert kwargs["cron_deliver_env_var"] == "ONEBOT_HOME_CHANNEL"
+        assert kwargs["standalone_sender_fn"] is _standalone_send
+        assert kwargs["allowed_users_env"] == "ONEBOT_ALLOWED_USERS"
+        assert kwargs["allow_all_env"] == "ONEBOT_ALLOW_ALL_USERS"
+        assert kwargs["max_message_length"] == QQ_TEXT_LIMIT * 2
+        assert kwargs["emoji"] == "🐧"
+        assert kwargs["pii_safe"] is False
+        hint = kwargs["platform_hint"]
+        assert "QQ" in hint and "Markdown" in hint and "[图片:m1]" in hint
+        assert "8643" in kwargs["install_hint"]
+
+    def test_registers_tool_and_skill(self):
+        ctx = MagicMock()
+        plugin.register(ctx)
+        tool_kwargs = ctx.register_tool.call_args.kwargs
+        assert tool_kwargs["name"] == "onebot_call"
+        assert tool_kwargs["toolset"] == "onebot"
+        assert tool_kwargs["is_async"] is True
+        assert callable(tool_kwargs["handler"])
+        assert callable(tool_kwargs["check_fn"])
+        skill_args = ctx.register_skill.call_args
+        assert skill_args.args[0] == "onebot"
+        assert skill_args.args[1].name == "SKILL.md"
+
+    def test_adapter_factory_registers_live_adapter(self):
+        ctx = MagicMock()
+        plugin.register(ctx)
+        factory = ctx.register_platform.call_args.kwargs["adapter_factory"]
+        config = PlatformConfig(enabled=True, extra={"token": "t"})
+        adapter = factory(config)
+        assert isinstance(adapter, OnebotAdapter)
+        assert adapter in tools._LIVE_ADAPTERS  # 工具层能找到它（弱引用）
+
+    def test_check_fn_passive_probe(self):
+        # 被动探测：aiohttp 可导入即 True；绝不安装东西
+        assert check_onebot_requirements() is True
+
+
+# ---------------------------------------------------------------------------
+# onebot_call 工具（白名单 / 管理员档 / media_id 桥接）
+# ---------------------------------------------------------------------------
+
+class TestOnebotCallWhitelist:
+    def test_unknown_action_rejected(self, monkeypatch):
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: None)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler({"action": "set_restart"})))
+        assert "not in the onebot_call whitelist" in result["error"]
+        assert result["action"] == "set_restart"
+
+    def test_action_required(self):
+        result = _handler_result(asyncio_run(tools._onebot_call_handler({})))
+        assert "action" in result["error"]
+
+    def test_params_must_be_dict(self):
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler({"action": "get_msg", "params": "x"})))
+        assert "params" in result["error"]
+
+    def test_read_action_success_shape(self, monkeypatch):
+        fake = fake_live_adapter(responses={"get_login_info": {"user_id": 1}})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_login_info", "params": {}})))
+        assert result == {"success": True, "action": "get_login_info",
+                          "status": "ok", "retcode": 0, "data": {"user_id": 1}}
+        assert fake.calls == [("get_login_info", {}, 30.0)]
+
+    def test_no_adapter_reports_error(self, monkeypatch):
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: None)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler({"action": "get_status"})))
+        assert "gateway" in result["error"].lower()
+
+    def test_disconnected_adapter_reports_dial_in_hint(self, monkeypatch):
+        fake = fake_live_adapter(connected=False)
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler({"action": "get_status"})))
+        assert "not connected" in result["error"]
+        assert "retryable" not in result  # 未连接分支不承诺 retryable
+
+    def test_network_error_maps_without_retryable(self, monkeypatch):
+        fake = fake_live_adapter(responses={"get_msg": NetworkError("超时")})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler(
+                {"action": "get_msg", "params": {"message_id": 1}})))
+        assert "timed out" in result["error"]
+
+    def test_api_error_carries_retcode_and_raw(self, monkeypatch):
+        err = OneBotApiError(retcode=1200, wording="denied", action="get_msg",
+                             payload={"status": "failed"})
+        fake = fake_live_adapter(responses={"get_msg": err})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler(
+                {"action": "get_msg", "params": {"message_id": 1}})))
+        assert result["error"] != ""
+        assert result["retcode"] == 1200
+        assert result["raw"] == {"status": "failed"}
+
+
+class TestOnebotCallAdminTier:
+    def test_admin_action_refused_on_local_session(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "")
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "set_group_ban", "params": {}})))
+        assert "read-only" in result["error"]
+
+    def test_admin_action_requires_admin_list(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "onebot")
+        fake = fake_live_adapter(admins=())
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "set_group_ban", "params": {}})))
+        assert "ONEBOT_ADMIN_USERS" in result["error"]
+
+    def test_admin_action_requires_connected_adapter(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "onebot")
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: None)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "set_group_ban", "params": {}})))
+        assert "connected OneBot adapter" in result["error"]
+
+    def test_admin_action_passes_for_listed_caller(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "onebot")
+        fake = fake_live_adapter(admins=("10001",), session_user="10001")
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "set_group_ban",
+             "params": {"group_id": 1, "user_id": 2, "duration": 60}})))
+        assert result["success"] is True
+        assert fake.calls[0][0] == "set_group_ban"
+        assert fake.calls[0][1] == {"group_id": 1, "user_id": 2, "duration": 60}
+
+    def test_admin_action_refused_for_unlisted_caller(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "onebot")
+        fake = fake_live_adapter(admins=("10001",), session_user="99999")
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "set_group_kick", "params": {}})))
+        assert "not on that list" in result["error"]
+
+    def test_admin_and_read_sets_are_disjoint(self):
+        assert not (tools.ADMIN_ACTIONS & tools.READ_SEND_ACTIONS)
+        assert "set_group_kick" in tools.ADMIN_ACTIONS
+        assert "get_msg" in tools.READ_SEND_ACTIONS
+        assert "send_msg" in tools.READ_SEND_ACTIONS
+
+
+class TestMediaIdBridge:
+    def _registry_with_image(self) -> MediaRegistry:
+        registry = MediaRegistry()
+        registry.register("image", url="https://e.com/a.jpg",
+                          file="abc.jpg", file_size=1024)
+        return registry
+
+    def test_media_id_resolved_to_file_ref(self, monkeypatch):
+        fake = fake_live_adapter(registry=self._registry_with_image())
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        assert result["success"] is True
+        action, params, _ = fake.calls[0]
+        assert action == "get_image"
+        assert params == {"file": "abc.jpg", "file_size": 1024}  # media_id 已还原
+
+    def test_media_id_falls_back_to_url(self, monkeypatch):
+        registry = MediaRegistry()
+        registry.register("image", url="https://e.com/b.jpg")  # 无 file 字段
+        fake = fake_live_adapter(registry=registry)
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        assert result["success"] is True
+        assert fake.calls[0][1] == {"file": "https://e.com/b.jpg"}
+
+    def test_unknown_media_id_reports_error_without_api_call(self, monkeypatch):
+        fake = fake_live_adapter(registry=self._registry_with_image())
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m9"}})))
+        assert "media_id not found" in result["error"]
+        assert fake.calls == []  # 未发出任何 API 请求
+
+    def test_no_registry_also_reports_error(self, monkeypatch):
+        fake = fake_live_adapter()  # current_registry 为 None
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_record", "params": {"media_id": "m1"}})))
+        assert "media_id not found" in result["error"]
+
+    def test_media_action_without_media_id_passes_through(self, monkeypatch):
+        fake = fake_live_adapter()
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_file", "params": {"file": "xyz"}})))
+        assert result["success"] is True
+        assert fake.calls[0][1] == {"file": "xyz"}
+
+    def test_extra_params_preserved_beside_file(self, monkeypatch):
+        fake = fake_live_adapter(registry=self._registry_with_image())
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_record",
+             "params": {"media_id": "m1", "out_format": "mp3"}})))
+        assert result["success"] is True
+        assert fake.calls[0][1] == {"out_format": "mp3", "file": "abc.jpg",
+                                    "file_size": 1024}
+
+
+class TestToolVisibility:
+    def test_available_when_session_platform_is_onebot(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "onebot")
+        assert tools.check_onebot_available() is True
+
+    def test_unavailable_without_adapter_or_session(self, monkeypatch):
+        monkeypatch.setattr(tools, "_session_platform", lambda: "")
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: None)
+        assert tools.check_onebot_available() is False
+
+    def test_schema_declares_action_catalog(self):
+        schema = tools.ONEBOT_CALL_SCHEMA
+        assert schema["name"] == "onebot_call"
+        assert schema["parameters"]["required"] == ["action"]
+        description = schema["description"]
+        for marker in ("ONEBOT_ADMIN_USERS", "[图片:m1]", "get_group_msg_history",
+                       "REJECTED"):
+            assert marker in description
+
+    def test_tool_result_is_json_string(self, monkeypatch):
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: None)
+        raw = asyncio_run(tools._onebot_call_handler({"action": "get_status"}))
+        assert isinstance(raw, str)
+        json.loads(raw)  # 必须是合法 JSON（工具注册表只收 str）

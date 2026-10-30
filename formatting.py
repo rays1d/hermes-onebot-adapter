@@ -24,6 +24,7 @@ _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_BOLD_UNDER_RE = re.compile(r"(?<!_)__(.+?)__(?!_)", re.DOTALL)  # __x__ 也是粗体
 _ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
 _ITALIC_UNDER_RE = re.compile(r"(?<!_)_([^_\n]+)_(?!_)")
 _STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
@@ -46,8 +47,9 @@ def strip_markdown(text: str) -> str:
     text = _IMAGE_RE.sub(lambda m: f"[图片: {m.group(1).strip()}]".rstrip(), text)
     text = _LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
 
-    # 3) 强调/删除线/行内代码：去标记留内容
+    # 3) 强调/删除线/行内代码：去标记留内容（__x__ 是粗体，先于单下划线斜体处理）
     text = _BOLD_RE.sub(r"\1", text)
+    text = _BOLD_UNDER_RE.sub(r"\1", text)
     text = _STRIKE_RE.sub(r"\1", text)
     text = _ITALIC_STAR_RE.sub(r"\1", text)
     text = _ITALIC_UNDER_RE.sub(r"\1", text)
