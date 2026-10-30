@@ -187,9 +187,16 @@ def _bridge_media_id(adapter, params: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 # ── action 执行 ───────────────────────────────────────────────────────────────
 
-async def _do_onebot_call(action: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """把白名单内的 action 经 live adapter 的反向 WS 连接发给实现端。"""
-    adapter = _get_onebot_adapter()
+async def _do_onebot_call(
+    action: str, params: Dict[str, Any], *, adapter: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """把白名单内的 action 经 live adapter 的反向 WS 连接发给实现端。
+
+    ``adapter`` 已解析时直接复用（调用方 _onebot_call_handler 保证判定与
+    执行同实例）；为 None 时自行解析（保持独立可用）。
+    """
+    if adapter is None:
+        adapter = _get_onebot_adapter()
     if adapter is None:
         return {
             "error": (
@@ -261,9 +268,11 @@ async def _onebot_call_handler(args: Dict[str, Any], **kwargs) -> str:
     if not isinstance(params, dict):
         return _as_tool_result({"error": "'params' must be an object/dict of action parameters."})
 
-    # fail-closed 白名单：管理类先过管理员档，未知 action 直接拒绝
+    # fail-closed 白名单：管理类先过管理员档，未知 action 直接拒绝。
+    # adapter 只解析一次：管理员判定与实际执行用同一个实例（防两次解析间
+    # live adapter 更换导致「判的是 A、发的是 B」的归属错位）。
+    adapter = _get_onebot_adapter()
     if action in ADMIN_ACTIONS:
-        adapter = _get_onebot_adapter()
         error = _admin_verdict(adapter)
         if error:
             return _as_tool_result({"error": error, "action": action})
@@ -277,7 +286,7 @@ async def _onebot_call_handler(args: Dict[str, Any], **kwargs) -> str:
             "action": action,
         })
 
-    return _as_tool_result(await _do_onebot_call(action, params))
+    return _as_tool_result(await _do_onebot_call(action, params, adapter=adapter))
 
 
 # ── schema（description 内嵌 action 目录）─────────────────────────────────────

@@ -91,6 +91,27 @@ class TestEchoMatching:
             assert "boom" in exc_info.value.wording
 
     @pytest.mark.asyncio
+    async def test_async_status_is_not_a_failure(self):
+        """status=async（限速/已提交异步处理）：不算失败，按成功返回。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            fake.custom_responses["send_msg"] = {
+                "status": "async", "retcode": 1, "data": None}
+            payload = await adapter._call_api("send_msg", {"message": []})
+            assert payload["status"] == "async"
+            assert payload["retcode"] == 1
+
+    @pytest.mark.asyncio
+    async def test_retcode_1_with_unrecognized_status_is_not_a_failure(self):
+        """retcode=1 = 已提交处理（communication/http.md），不得谎报失败。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            fake.custom_responses["send_msg"] = {
+                "status": "", "retcode": 1, "data": None}
+            payload = await adapter._call_api("send_msg", {"message": []})
+            assert payload["retcode"] == 1
+
+    @pytest.mark.asyncio
     async def test_not_connected_raises_retryable(self):
         async with running_adapter() as (adapter, harness):
             # server 已起但实现端未拨入

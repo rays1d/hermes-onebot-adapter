@@ -61,7 +61,7 @@ optional_env:
     prompt: "Allowed groups (comma-separated)"
     password: false
   - name: ONEBOT_ADMIN_USERS
-    description: "Comma-separated QQ numbers granted the admin tier — unlocks dangerous napcat_call actions such as group management"
+    description: "Comma-separated QQ numbers granted the admin tier — unlocks dangerous onebot_call actions such as group management"
     prompt: "Admin users (comma-separated)"
     password: false
   - name: ONEBOT_ALLOW_ALL_USERS

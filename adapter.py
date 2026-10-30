@@ -796,8 +796,14 @@ class OnebotAdapter(BasePlatformAdapter):
 
         status = str(payload.get("status") or "")
         retcode = payload.get("retcode")
-        failed = status == "failed" or (
-            isinstance(retcode, int) and not isinstance(retcode, bool) and retcode != 0)
+        int_retcode = (
+            retcode if isinstance(retcode, int) and not isinstance(retcode, bool) else None)
+        # retcode=1 / status=async：请求已提交异步处理（限速或 *_async 调用），
+        # 结果未知但**不算失败**——按成功返回（data/message_id 为空，OneBot 11
+        # communication/http.md 的响应语义）。谎报失败会让发送侧重发、造成重复消息。
+        if status == "async" or int_retcode == 1:
+            return payload
+        failed = status == "failed" or (int_retcode is not None and int_retcode != 0)
         if failed:
             wording = str(payload.get("wording") or payload.get("message") or "未知错误")
             raise OneBotApiError(retcode=retcode, wording=wording, action=action, payload=payload)
