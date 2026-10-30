@@ -9,7 +9,7 @@ description: >
   (events + API over one socket), and relays messages between QQ private
   chats/groups and the Hermes agent. Inbound rich media is surfaced as
   inline markers (e.g. `[图片:m1]`) the agent resolves on demand via the
-  `napcat_call` tool (get_image/get_record/get_file); outbound media is
+  `onebot_call` tool (get_image/get_record/get_file); outbound media is
   streamed with `upload_file_stream` (NapCat v4.8.115+) and falls back to
   base64. Designed for cross-machine deployments (e.g. over an EasyTier
   mesh): no `file://` shortcuts, every media path is URL/stream based.

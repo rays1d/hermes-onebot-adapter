@@ -266,6 +266,9 @@ class OnebotAdapter(BasePlatformAdapter):
         self._last_heartbeat: float = 0.0
         self._registry: Optional[MediaRegistry] = None    # 最近一条消息的媒体注册表
         self._upload_unsupported: bool = False            # upload_file_stream 探测失败后永久回退
+        # 最近一条通过门控的入站消息归属（tools.py 管理员档判定用）
+        self._last_session_user: Optional[str] = None
+        self._last_session_chat_id: Optional[str] = None
 
         self._dedup = MessageDeduplicator()
 
@@ -294,8 +297,27 @@ class OnebotAdapter(BasePlatformAdapter):
         return self._self_id
 
     def current_registry(self) -> Optional[MediaRegistry]:
-        """最近一条入站消息的媒体注册表（``napcat_call`` 工具按 media_id 查引用用）。"""
+        """最近一条入站消息的媒体注册表（``onebot_call`` 工具按 media_id 查引用用）。"""
         return self._registry
+
+    @property
+    def last_session_user(self) -> Optional[str]:
+        """最近一条通过门控的入站消息发送者 QQ 号。
+
+        ``onebot_call`` 的管理员档判定用：工具执行期间归属当前回合的调用
+        者。并发多会话下以最后过门控者为准（单用户部署无歧义）。
+        """
+        return self._last_session_user
+
+    @property
+    def last_session_chat_id(self) -> Optional[str]:
+        """最近一条通过门控的入站消息所属会话（``group:<gid>`` 或私聊 QQ 号）。"""
+        return self._last_session_chat_id
+
+    @property
+    def admin_users(self) -> tuple[str, ...]:
+        """管理员 QQ 号集合（ONEBOT_ADMIN_USERS）。"""
+        return tuple(self._admin_users)
 
     # ------------------------------------------------------------------
     # 门控（分面策略，fail-closed）
@@ -678,6 +700,9 @@ class OnebotAdapter(BasePlatformAdapter):
         user_name = (str(sender.get("card") or "").strip()
                      or str(sender.get("nickname") or "").strip() or None)
         chat_id = f"group:{group_id}" if chat_type == "group" else user_id
+        # 工具层管理员归属：记录最近一次通过门控的调用者与所属会话
+        self._last_session_user = user_id
+        self._last_session_chat_id = chat_id
         source = self.build_source(
             chat_id=chat_id, chat_type=chat_type, user_id=user_id,
             user_name=user_name, message_id=msg_key,
