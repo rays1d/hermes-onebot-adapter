@@ -70,6 +70,31 @@ class TestStripMarkdown:
         text = "# 命令\n\n- foo\n- bar\n\n说明文字"
         assert strip_markdown(text) == "命令\n\n• foo\n• bar\n\n说明文字"
 
+    def test_hrule_only_drops_its_own_line(self):
+        """回归（真机 AC5）：水平线只删自身行，其后内容不得被吞。
+
+        hermes cron 投递格式内嵌 `-------------` 分隔线；旧实现用
+        `[\s\S]*$` 把 hr 之后到文末的全部内容吞掉，导致正文丢失。
+        """
+        cron_text = (
+            "Cronjob Response: AC5-插件验收\n"
+            "(job_id: 0d135509ec6b)\n"
+            "-------------\n\n"
+            "你好！这是一条通过 cron 定时投递的测试消息。👋\n\n"
+            "To stop or manage this job, send me a new message."
+        )
+        out = strip_markdown(cron_text)
+        assert "Cronjob Response" in out
+        assert "你好" in out
+        assert "stop or manage" in out
+        assert "-" * 3 not in out  # hr 线本身被移除
+        # 各类 hr 形态都只影响自身行
+        assert strip_markdown("a\n***\nb") == "a\n\nb"
+        assert strip_markdown("a\n___\nb") == "a\n\nb"
+        assert strip_markdown("a\n- - -\nb") == "a\n\nb"
+        # 非整行的重复字符不是 hr，不动
+        assert strip_markdown("a--b") == "a--b"
+
 
 # ---------------------------------------------------------------------------
 # split_for_qq

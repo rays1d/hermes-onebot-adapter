@@ -32,7 +32,7 @@ _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE)
 _BLOCKQUOTE_RE = re.compile(r"^[ \t]*>[ \t]?", re.MULTILINE)
 _BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+", re.MULTILINE)
 _ORDERED_RE = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.MULTILINE)
-_HRULE_RE = re.compile(r"^[ \t]*([-*_])[ \t]*\1[ \t]*\1[\s\S]*$", re.MULTILINE)
+_HRULE_RE = re.compile(r"^[ \t]*([-*_])[ \t]*(?:\1[ \t]*)+$", re.MULTILINE)
 
 
 def strip_markdown(text: str) -> str:
