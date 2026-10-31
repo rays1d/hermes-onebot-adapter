@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -193,6 +194,22 @@ class TestRegister:
         skill_args = ctx.register_skill.call_args
         assert skill_args.args[0] == "onebot"
         assert skill_args.args[1].name == "SKILL.md"
+
+    def test_manifest_declares_provides_tools(self):
+        """平台插件默认延迟加载：CLI/TUI 进程不物化平台，不声明 provides_tools 则
+        register() 不运行，onebot_call 在非 gateway 会话完全缺失（loader #78050
+        语义）。声明后 loader 从 tools.py 预注册客户端工具，要求 register_tools(ctx)。"""
+        from agent.skill_utils import yaml_load
+        manifest_path = Path(plugin.__file__).parent / "plugin.yaml"
+        manifest = yaml_load(manifest_path.read_text(encoding="utf-8"))
+        assert manifest.get("provides_tools") == ["onebot_call"]
+        # loader 预注册入口：tools.py 必须暴露 register_tools(ctx)（plugins_loader.py 校验）
+        assert callable(getattr(tools, "register_tools", None))
+        # 预注册走 ctx.register_tool，与 register() 同一入口 → 幂等（同 toolset 重注册放行）
+        ctx = MagicMock()
+        tools.register_tools(ctx)
+        ctx.register_tool.assert_called_once()
+        assert ctx.register_tool.call_args.kwargs["name"] == "onebot_call"
 
     def test_adapter_factory_registers_live_adapter(self):
         ctx = MagicMock()
