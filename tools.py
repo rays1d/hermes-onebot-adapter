@@ -162,6 +162,7 @@ def _admin_verdict(adapter) -> Optional[str]:
 # ── media_id 桥接 ─────────────────────────────────────────────────────────────
 
 _MAX_MEDIA_BYTES = 28 * 1024 * 1024  # 与 WS 帧上限同量级的下载护栏
+_MEDIA_CALL_TIMEOUT = 90.0  # 媒体 get 动作实测在慢链路上需 ~30s+，默认 30s 贴崖，放宽到 90s
 
 
 def _sniff_image(raw: bytes) -> Optional[tuple[str, str]]:
@@ -382,7 +383,10 @@ async def _do_onebot_call(
             params = {key: value for key, value in (params or {}).items() if key != "media_id"}
 
     try:
-        response = await call_action(action, params or {})
+        if action in _MEDIA_ACTIONS:
+            response = await call_action(action, params or {}, timeout=_MEDIA_CALL_TIMEOUT)
+        else:
+            response = await call_action(action, params or {})
     except NotConnectedError as exc:
         return {"error": f"OneBot action '{action}' failed: {exc}", "retryable": True}
     except NetworkError as exc:
