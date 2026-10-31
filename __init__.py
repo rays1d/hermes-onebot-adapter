@@ -193,7 +193,9 @@ def register(ctx) -> None:
             "inbound group messages carry a sender-name prefix. Images/voice/files "
             "arrive as [图片:m1] / [语音:m1] / [文件:<name>:m1] markers — resolve them "
             "on demand with the onebot_call tool (get_image / get_record / get_file "
-            "accept {media_id: 'm1'})."
+            "accept {media_id: 'm1'}; results include a ready-to-use local_file). "
+            "To send media back, put MEDIA:/absolute/path lines in your reply text — "
+            "the gateway delivers them as QQ image/voice/video/file messages."
         ),
     )
 

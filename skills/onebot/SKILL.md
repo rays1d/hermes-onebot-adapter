@@ -42,16 +42,18 @@ description: QQ（OneBot 11 / NapCat）平台的输出风格、onebot_call 动�
 ## 入站媒体标记与解析
 
 - 收到的图片/语音/视频/文件以内联标记呈现：`[图片:m1]`、`[语音:m1]`、`[视频:m1]`、`[文件:报告.pdf:m1]`。`m1` 是**本条消息内**的媒体编号。
-- 需要看图/听语音/取文件时，用 `onebot_call` 把 `media_id` 传给对应 get 动作，工具会自动还原成实现端的 file 引用：
-  - 图片：`{"action": "get_image", "params": {"media_id": "m1"}}` → `data` 里含 `url` / 本地 `file`（路径）等；有 url 即可视觉识图或转述给用户。
-  - 语音：`{"action": "get_record", "params": {"media_id": "m1"}}`（可加 `"out_format": "mp3"`）。
+- 需要看图/听语音/取文件时，用 `onebot_call` 把 `media_id` 传给对应 get 动作，工具会自动还原成实现端的 file 引用（内含 get_msg 兑底：实现端事件段没带 url/file 时会自动按消息号重取）：
+  - 图片：`{"action": "get_image", "params": {"media_id": "m1"}}` → 成功后 `data` 里**直接带 `local_file`（本地缓存路径）与 `mime`**，可直接交给视觉工具识图，无需自己下载。
+  - 语音：`{"action": "get_record", "params": {"media_id": "m1"}}`（默认服务端转 wav；可覆盖 `"out_format": "mp3"`）。
   - 文件：`{"action": "get_file", "params": {"media_id": "m1"}}`。
-- 媒体 id 只对**最近一条入站消息**有效（注册表按消息轮换）；跨消息引用会得到 "media_id not found" 错误——此时请对方重发，或用 get_group_msg_history 找回上下文。
+- 媒体 id 对**最近 10 条入站消息**有效（注册表环）；更早的标记会得到明确报错——此时用 get_msg / get_group_msg_history 按消息号重取。
+- 历史类接口（get_group_msg_history 等）的回包里内嵌 base64 已被替换为省略标记，不要试图直接用它们；需要媒体时按消息号拿 url 或用 get 动作。
 - 不需要处理媒体时**不要主动拉取**（跨机链路带宽有限，按需取用）。
 
 ## 出站发送
 
-- 普通文本直接回复即可；发图/语音/视频/文件走平台媒体回复通道（send_image / send_voice / send_video / send_document），网关自动路由到 OneBot 的 image/record/video 段与 upload_*_file。
+- **发媒体的首选方式**：在回复文本里写 `MEDIA:/绝对路径/文件名`（每行一个）。网关会拦截并路由为 QQ 的图片/语音/视频/文件消息；`get_image/get_record/get_file` 返回的 `local_file` 路径可以直接这样回发。
+- 普通文本直接回复即可；长回复会被自动按句边界分段发送。
 - 也可用 `onebot_call` 显式发送：`send_msg` / `send_private_msg` / `send_group_msg`，`message` 支持纯文本字符串或段数组，例如 `[{"type": "image", "data": {"file": "https://example.com/a.png"}}]`。
 - 跨机部署（EasyTier 等内网）下，本地大文件出站会优先走 NapCat 的流式上传（≥ 4.8.115），失败自动回退 base64——无需关心细节。
 
