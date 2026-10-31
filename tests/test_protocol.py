@@ -8,6 +8,7 @@ meta 心跳、坏帧容错。
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 
 import aiohttp
@@ -23,6 +24,7 @@ from onebot_plugin.adapter import (
     NetworkError,
     NotConnectedError,
     OneBotApiError,
+    UnknownOutcome,
 )
 
 ECHO_RE = re.compile(r"^\d+:\d+$")
@@ -60,13 +62,45 @@ class TestEchoMatching:
             assert [int(e.split(":")[1]) for e in echoes] == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_timeout_raises_network_error_and_cleans_pending(self):
+    async def test_submitted_timeout_raises_unknown_outcome_and_cleans_pending(self):
+        """已提交后回包超时 → UnknownOutcome（结果未知，绝不回落为可重试失败）。"""
         async with running_adapter() as (adapter, harness):
             fake = await harness.dial_bot()
             fake.hold_actions.add("get_status")
-            with pytest.raises(NetworkError):
+            with pytest.raises(UnknownOutcome) as exc_info:
                 await adapter._call_api("get_status", {}, timeout=0.2)
+            assert exc_info.value.action == "get_status"
             assert adapter._pending == {}  # 超时后 pending 不泄漏
+
+    @pytest.mark.asyncio
+    async def test_unknown_outcome_when_connection_drops_after_submission(self):
+        """已提交后连接断开 → UnknownOutcome（不得回落为可重试的 NotConnectedError）。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            fake.drop_on_call = {"get_status": {1}}
+            task = asyncio.create_task(adapter._call_api("get_status", {}, timeout=5))
+            await fake.wait_action("get_status")
+            with pytest.raises(UnknownOutcome) as exc_info:
+                await asyncio.wait_for(task, 2)
+            assert exc_info.value.action == "get_status"
+
+    @pytest.mark.asyncio
+    async def test_send_failure_before_submission_is_retryable(self):
+        """ws.send 本身失败（未提交）→ NetworkError，retryable=True。"""
+        async with running_adapter() as (adapter, harness):
+            await harness.dial_bot()
+
+            class ExplodingWs:
+                closed = False
+
+                async def send_json(self, payload):
+                    raise ConnectionError("boom")
+
+            adapter._ws = ExplodingWs()
+            with pytest.raises(NetworkError) as exc_info:
+                await adapter._call_api("get_status", {}, timeout=1)
+            assert exc_info.value.retryable is True
+            assert adapter._pending == {}  # 提交失败不泄漏 pending
 
     @pytest.mark.asyncio
     async def test_failed_status_raises_api_error(self):
@@ -170,8 +204,8 @@ class TestConnectionLifecycle:
 
             # 同端点新连接拨入：挤掉旧连接
             fake2 = await harness.dial_bot()
-            with pytest.raises(NotConnectedError):
-                await asyncio.wait_for(task, 2)  # 旧连接 pending 被明确失败
+            with pytest.raises(UnknownOutcome):
+                await asyncio.wait_for(task, 2)  # 请求已提交但连接被替换：结局未知
 
             assert adapter._generation == 2
             ws2 = adapter._ws
@@ -190,8 +224,8 @@ class TestConnectionLifecycle:
             task = asyncio.create_task(adapter._call_api("get_status", {}, timeout=5))
             await fake.wait_action("get_status")
             await adapter.disconnect()
-            with pytest.raises(NotConnectedError):
-                await task
+            with pytest.raises(UnknownOutcome):
+                await task  # 请求已提交但连接关闭：结局未知
             await asyncio.wait_for(fake.closed_event.wait(), 2)
 
     @pytest.mark.asyncio
@@ -246,6 +280,26 @@ class TestResponseGuard:
             assert adapter._last_heartbeat > 0  # 连接未被坏帧破坏
 
     @pytest.mark.asyncio
+    async def test_echo_frame_never_enters_message_flow(self, monkeypatch):
+        """带非空 echo 的帧一律按回包处理：即使携带 post_type 也绝不进消息流。"""
+        from conftest import install_message_handler, settle
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event({
+                "echo": "7:1", "post_type": "message", "message_type": "private",
+                "message_id": 555, "user_id": 999,
+                "sender": {"user_id": 999, "nickname": "x"}, "message": "hi"})
+            await settle()
+            assert events == []
+            # 连接未被破坏：后续正常事件照常处理
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "heartbeat",
+                "self_id": SELF_ID})
+            await asyncio.sleep(0.05)
+            assert adapter._last_heartbeat > 0
+
+    @pytest.mark.asyncio
     async def test_message_sent_echo_self_ignored(self, monkeypatch):
         """go-cqhttp 系 ``message_sent`` 回显等同 self 消息：不进 agent。"""
         from conftest import install_message_handler, settle
@@ -258,3 +312,27 @@ class TestResponseGuard:
                 "sender": {"user_id": 999, "nickname": "x"}, "message": "echo"})
             await settle()
             assert events == []
+
+
+# ---------------------------------------------------------------------------
+# 帧大小防御
+# ---------------------------------------------------------------------------
+
+class TestOversizedFrameGuard:
+    @pytest.mark.asyncio
+    async def test_oversized_frame_skipped_and_connection_survives(self):
+        """超过处理阈值的单帧整体丢弃（连接保持）；协议层 50MB 硬上限兑底。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            big = "x" * (4 * 1024 * 1024 + 128)  # > 4MB 处理阈值，< 50MB 协议上限
+            await fake.ws.send_str(json.dumps(
+                {"echo": "1:1", "post_type": "meta_event",
+                 "meta_event_type": "heartbeat", "self_id": SELF_ID, "blob": big}))
+            await asyncio.sleep(0.3)  # 大帧传输 + 跳过判定
+            assert adapter._last_heartbeat == 0.0  # 大帧未进入分派
+            # 连接存活：后续正常帧照常处理
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "heartbeat",
+                "self_id": SELF_ID})
+            await asyncio.sleep(0.05)
+            assert adapter._last_heartbeat > 0

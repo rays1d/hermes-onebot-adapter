@@ -68,7 +68,8 @@ DEFAULT_MAX_MSG_CHARS = QQ_TEXT_LIMIT
 DEFAULT_API_TIMEOUT = 30.0        # 单个 action 的默认等待秒数（可 per-call 覆盖）
 REPLY_FETCH_TIMEOUT = 5.0         # 取引用原文的等待秒数（快速降级，不拖慢主链路）
 SEND_CHUNK_INTERVAL_S = 0.3       # 分段间隔：缓解个人号高频发送风控
-WS_MAX_MSG_SIZE = 4 * 1024 * 1024  # 入站帧上限——绝不用 0（无限制）
+WS_MAX_MSG_SIZE = 4 * 1024 * 1024  # 处理层：超过此大小的入站帧直接丢弃（连接保持）
+WS_PROTOCOL_MAX_MSG_SIZE = 50 * 1024 * 1024  # aiohttp 层硬上限：防异常超大帧打爆内存
 STREAM_UPLOAD_CHUNK_SIZE = 64 * 1024        # upload_file_stream 分块大小
 STREAM_UPLOAD_RETENTION_MS = 30 * 1000      # NapCat 侧流式文件保留时长
 
@@ -92,11 +93,36 @@ class NotConnectedError(Exception):
 
 
 class NetworkError(Exception):
-    """动作超时或链路级失败（帧可能已写出，发送侧不得自动重试）。"""
+    """请求帧未能提交到实现端（``ws.send`` 本身失败）——消息确定未发出。
+
+    发送侧视为**可重试**（与 ：class:`UnknownOutcome` 相对：那个是「已提交但结局未知」）。
+    """
+
+    retryable = True
+
+
+class UnknownOutcome(Exception):
+    """请求帧**已提交**到实现端，但未观测到回包——结局未知。
+
+    触发场景：回包等待超时、等待期间连接断开/被替换。此时动作**可能已生效**
+    （消息可能已送达），自动重试会造成重复消息——发送侧必须按不可重试处理，
+    是否补发交给上层决策。
+    """
+
+    retryable = False
+
+    def __init__(self, action: str, detail: str = "") -> None:
+        self.action = action
+        text = f"OneBot 动作 {action!r} 已提交但结果未知"
+        if detail:
+            text += f"（{detail}）"
+        super().__init__(text)
 
 
 class OneBotApiError(Exception):
-    """OneBot action 执行失败（status=failed 或 retcode≠0）。"""
+    """OneBot action 执行失败（status=failed 或 retcode≠0）。明确失败，不可重试。"""
+
+    retryable = False
 
     def __init__(self, retcode: Any, wording: str, action: str, payload: Any = None) -> None:
         self.retcode = retcode
@@ -443,7 +469,11 @@ class OnebotAdapter(BasePlatformAdapter):
             self._runner = None
 
     def _fail_pending_for(self, ws: Any, reason: str) -> None:
-        """只清掉「写在给定连接上」的 pending——新连接的请求不受旧连接 teardown 影响。"""
+        """只清掉「写在给定连接上」的 pending——新连接的请求不受旧连接 teardown 影响。
+
+        以 NotConnectedError 注入失败；``_call_api`` 在等待回包语境下把该异常转换为
+        :class:`UnknownOutcome`（帧已提交、结局未知），语义区分在那里完成。
+        """
         for echo, (owner, fut) in list(self._pending.items()):
             if owner is ws:
                 self._pending.pop(echo, None)
@@ -491,7 +521,7 @@ class OnebotAdapter(BasePlatformAdapter):
             logger.warning("[%s] 拒绝未鉴权的 WS 拨入 remote=%s", self.name, request.remote)
             return web.Response(status=401, text="unauthorized")
 
-        ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=WS_MAX_MSG_SIZE)
+        ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=WS_PROTOCOL_MAX_MSG_SIZE)
         await ws.prepare(request)
 
         # NapCat 在升级请求里带 X-Self-ID；lifecycle.connect 帧会再补一次
@@ -516,6 +546,11 @@ class OnebotAdapter(BasePlatformAdapter):
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
+                    if len(msg.data) > WS_MAX_MSG_SIZE:
+                        # 异常超大帧：整体丢弃不解析，连接保持（协议层 50MB 硬上限兜底）
+                        logger.warning("[%s] 丢弃超大帧 %d bytes（阈值 %d）", self.name,
+                                       len(msg.data), WS_MAX_MSG_SIZE)
+                        continue
                     payload = self._safe_parse_json(msg.data)
                     if payload is not None:
                         self._dispatch(payload, ws)
@@ -550,7 +585,9 @@ class OnebotAdapter(BasePlatformAdapter):
     def _dispatch(self, payload: dict, ws: Any) -> None:
         """按帧内容分派：API 回包 / meta / message；notice & request 仅记日志。"""
         echo = payload.get("echo")
-        if echo is not None and "post_type" not in payload:
+        if echo is not None and str(echo).strip():
+            # 任何带非空 echo 的帧都是 API 回包：resolve 或丢弃，绝不进消息流——
+            # 防御畸形实现把 post_type 与 echo 混在同一帧里
             self._resolve_response(str(echo), ws, payload)
             return
 
@@ -770,9 +807,13 @@ class OnebotAdapter(BasePlatformAdapter):
     ) -> dict:
         """向实现端发起 action 并等待同 echo 回包，返回完整响应 dict。
 
-        - 无连接 → :class:`NotConnectedError`（可重试）
-        - 超时 / 发送失败 → :class:`NetworkError`（发送侧不得自动重试）
-        - status=failed 或 retcode≠0 → :class:`OneBotApiError`
+        异常契约（三态，发送侧据此决定是否自动重试）：
+
+        - **未提交**（无连接 / ``ws.send`` 失败）→ :class:`NotConnectedError` /
+          :class:`NetworkError`——消息确定未发出，可安全重试
+        - **已提交但结局未知**（回包超时 / 等待期间连接断开）→ :class:`UnknownOutcome`
+          ——消息可能已送达，**不得**自动重试
+        - **明确失败**（status=failed 或 retcode≠0）→ :class:`OneBotApiError`
         """
         ws = self._live_ws()
         if ws is None:
@@ -792,7 +833,12 @@ class OnebotAdapter(BasePlatformAdapter):
             payload = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending.pop(echo, None)
-            raise NetworkError(f"{action} 超时（等待 {timeout}s）") from None
+            # 帧已写出，实现端可能已执行——结局未知，绝不转为可重试失败
+            raise UnknownOutcome(action, f"等待回包超时 {timeout}s，消息可能已送达") from None
+        except NotConnectedError as exc:
+            # pending 被连接清理失败（断开/被新连接替换）：帧已提交，结局未知
+            self._pending.pop(echo, None)
+            raise UnknownOutcome(action, str(exc)) from exc
 
         status = str(payload.get("status") or "")
         retcode = payload.get("retcode")
@@ -840,10 +886,20 @@ class OnebotAdapter(BasePlatformAdapter):
         return "private", text
 
     def _error_result(self, exc: Exception) -> SendResult:
-        """异常 → SendResult：连接缺失可重试，其余（超时/API 失败）不重试。"""
-        if isinstance(exc, NotConnectedError):
+        """异常 → SendResult（与 :meth:`_call_api` 的三态异常契约对齐）。
+
+        - NotConnectedError / NetworkError：未提交 → 可重试
+        - UnknownOutcome：已提交但结局未知 → 不可重试；``error_kind="unknown"``
+          （SEND_ERROR_KINDS 成员）+ ``raw_response={"submitted": True}`` 供上层甄别
+        - OneBotApiError：实现端明确失败 → 不可重试
+        """
+        if isinstance(exc, UnknownOutcome):
+            return SendResult(
+                success=False, error=str(exc), retryable=False, error_kind="unknown",
+                raw_response={"submitted": True})
+        if isinstance(exc, (NotConnectedError, NetworkError)):
             return SendResult(success=False, error=str(exc), retryable=True)
-        return SendResult(success=False, error=str(exc))
+        return SendResult(success=False, error=str(exc), retryable=False)
 
     async def _send_message_segments(
         self, chat_type: str, target: str, segments: list[dict],
@@ -875,7 +931,12 @@ class OnebotAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        """发文本：markdown 剥离 → 句边界分段 → 逐段发送（段间 0.3s 防风控）。"""
+        """发文本：markdown 剥离 → 句边界分段 → 逐段发送（段间 0.3s 防风控）。
+
+        部分失败语义：第 N>1 段失败时，已发段落不可重发——返回 ``retryable=False``
+        的失败结果（``message_id``=最后成功段，其余已发段 id 进
+        ``continuation_message_ids``）；首段失败则原样透传（retryable 不改）。
+        """
         del metadata
         chat_type, target = self._resolve_chat_target(chat_id)
         text = strip_markdown(content or "")
@@ -893,7 +954,15 @@ class OnebotAdapter(BasePlatformAdapter):
                 chat_type, target, [{"type": "text", "data": {"text": chunk}}],
                 reply_to=reply_to if idx == 0 else None)
             if not last.success:
-                return last
+                if idx == 0:
+                    return last  # 首段即失败：未发出任何段，重试语义原样透传
+                # 已成功发出 idx 段——整体重试会重复这些段 → 强制不可重试；
+                # 末段 id 留在 message_id（后续编辑/引用对准最新一条），其余进 continuation
+                return dataclasses.replace(
+                    last,
+                    message_id=message_ids[-1] if message_ids else None,
+                    retryable=False,
+                    continuation_message_ids=tuple(message_ids[:-1]))
             if last.message_id:
                 message_ids.append(last.message_id)
             if idx < len(chunks) - 1:
@@ -947,7 +1016,9 @@ class OnebotAdapter(BasePlatformAdapter):
                     await self._call_api("upload_file_stream", params)
             final = await self._call_api(
                 "upload_file_stream", {"stream_id": stream_id, "is_complete": True})
-        except (NotConnectedError, NetworkError, OneBotApiError) as exc:
+        except (NotConnectedError, NetworkError, UnknownOutcome, OneBotApiError) as exc:
+            # UnknownOutcome（分块已提交但回包未至）也按探测失败回退 base64：
+            # 流未完成、无用户可见产物，重传不会产生重复消息
             return None, str(exc)
         except OSError as exc:
             return None, f"读取本地文件失败: {exc}"
@@ -1020,7 +1091,7 @@ class OnebotAdapter(BasePlatformAdapter):
         chat_type, target = self._resolve_chat_target(chat_id)
         try:
             media_ref = await self._media_segment_ref(path_or_url)
-        except (NotConnectedError, NetworkError, OneBotApiError) as exc:
+        except (NotConnectedError, NetworkError, UnknownOutcome, OneBotApiError) as exc:
             return self._error_result(exc)
         segment = [{"type": seg_type, "data": {"file": media_ref}}]
         return await self._send_message_segments(chat_type, target, segment)
@@ -1074,7 +1145,7 @@ class OnebotAdapter(BasePlatformAdapter):
         chat_type, target = self._resolve_chat_target(chat_id)
         try:
             file_ref = await self._document_ref(str(file_path))
-        except (NotConnectedError, NetworkError, OneBotApiError) as exc:
+        except (NotConnectedError, NetworkError, UnknownOutcome, OneBotApiError) as exc:
             return self._error_result(exc)
         display_name = str(file_name or os.path.basename(str(file_path)) or "file").strip() or "file"
         if chat_type == "group":

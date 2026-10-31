@@ -20,6 +20,7 @@ from onebot_plugin.adapter import (
     NetworkError,
     OneBotApiError,
     OnebotAdapter,
+    UnknownOutcome,
     check_onebot_requirements,
 )
 from onebot_plugin.formatting import QQ_TEXT_LIMIT
@@ -246,13 +247,25 @@ class TestOnebotCallWhitelist:
         assert "not connected" in result["error"]
         assert "retryable" not in result  # 未连接分支不承诺 retryable
 
-    def test_network_error_maps_without_retryable(self, monkeypatch):
-        fake = fake_live_adapter(responses={"get_msg": NetworkError("超时")})
+    def test_network_error_maps_as_retryable_before_submission(self, monkeypatch):
+        """未提交失败（ws.send 层）：工具结果标记 retryable。"""
+        fake = fake_live_adapter(responses={"get_msg": NetworkError("链路失败")})
         monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
         result = _handler_result(
             asyncio_run(tools._onebot_call_handler(
                 {"action": "get_msg", "params": {"message_id": 1}})))
-        assert "timed out" in result["error"]
+        assert "before submission" in result["error"]
+        assert result["retryable"] is True
+
+    def test_unknown_outcome_flagged_for_agent(self, monkeypatch):
+        """已提交但结果未知：明确告知 agent 不要盲目重试。"""
+        fake = fake_live_adapter(
+            responses={"get_status": UnknownOutcome("get_status", "超时")})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(
+            asyncio_run(tools._onebot_call_handler({"action": "get_status"})))
+        assert "outcome unknown" in result["error"]
+        assert result["outcome_unknown"] is True
 
     def test_api_error_carries_retcode_and_raw(self, monkeypatch):
         err = OneBotApiError(retcode=1200, wording="denied", action="get_msg",

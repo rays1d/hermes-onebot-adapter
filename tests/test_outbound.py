@@ -18,6 +18,21 @@ from onebot_plugin import standalone as standalone_mod
 from onebot_plugin.formatting import QQ_TEXT_LIMIT, split_for_qq, strip_markdown
 
 
+def _fast_timeout(adapter, monkeypatch, seconds: float = 0.2):
+    """把指定 adapter 的 _call_api 等待上限压到 ``seconds``（仅 send_msg）。
+
+    ``_send_message_segments`` 不透传 timeout 参数；这里包装实例方法，避免
+    「已提交后超时」用例真等 30s。
+    """
+    original = adapter._call_api
+
+    async def _wrapped(action, params=None, timeout=30.0):
+        return await original(
+            action, params, timeout=seconds if action == "send_msg" else timeout)
+
+    monkeypatch.setattr(adapter, "_call_api", _wrapped)
+
+
 # ---------------------------------------------------------------------------
 # strip_markdown
 # ---------------------------------------------------------------------------
@@ -195,6 +210,7 @@ class TestSendText:
 
     @pytest.mark.asyncio
     async def test_send_failure_propagates(self, no_chunk_delay):
+        """明确 API 失败：不可重试，错误透传。"""
         async with running_adapter() as (adapter, harness):
             fake = await harness.dial_bot()
             fake.fail_actions.add("send_msg")
@@ -202,13 +218,88 @@ class TestSendText:
             assert result.success is False
             assert result.error is not None
             assert "fake failure" in result.error
+            assert result.retryable is False
 
     @pytest.mark.asyncio
     async def test_send_without_connection_retryable(self, no_chunk_delay):
+        """未连接（未提交）→ 可重试，基类可安全自动重试。"""
         async with running_adapter() as (adapter, harness):
             result = await adapter.send(OTHER_USER, "没人在线")
             assert result.success is False
             assert result.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_submitted_timeout_not_retryable(self, no_chunk_delay, monkeypatch):
+        """已提交后超时 → retryable=False + error_kind=unknown + submitted 标记。
+
+        防重复消息核心：此时消息可能已送达，基类绝不自动重发。
+        """
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            fake.hold_actions.add("send_msg")
+            _fast_timeout(adapter, monkeypatch)
+            result = await adapter.send(OTHER_USER, "可能已送达")
+            assert result.success is False
+            assert result.retryable is False
+            assert result.error_kind == "unknown"
+            assert result.raw_response == {"submitted": True}
+            assert "未知" in result.error
+
+    @pytest.mark.asyncio
+    async def test_connection_drop_after_submission_not_retryable(self, no_chunk_delay):
+        """已提交后连接断开 → 同样按「结局未知」处理，不可重试。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial_bot()
+            fake.drop_on_call = {"send_msg": {1}}
+            result = await adapter.send(OTHER_USER, "断线前发出的")
+            assert result.success is False
+            assert result.retryable is False
+            assert result.error_kind == "unknown"
+            assert result.raw_response == {"submitted": True}
+
+    @pytest.mark.asyncio
+    async def test_later_chunk_failure_forces_not_retryable(self, no_chunk_delay):
+        """第 3 段失败：前 2 段已发出——retryable 强制 False，
+        message_id=末段成功 id，更早的已发段进 continuation。"""
+        async with running_adapter(max_msg_chars=12) as (adapter, harness):
+            fake = await harness.dial_bot()
+            _counter_ids(fake)
+            fake.fail_on_call = {"send_msg": {3}}
+            text = "第一句话。" * 6  # 30 字 → 12 字 × 3 段
+            result = await adapter.send(OTHER_USER, text)
+            assert result.success is False
+            assert result.retryable is False  # 重试会重复前 2 段
+            assert result.message_id == "1002"  # 最后成功段
+            assert result.continuation_message_ids == ("1001",)
+            frames = fake.requests_for("send_msg")
+            assert len(frames) == 3
+
+    @pytest.mark.asyncio
+    async def test_second_chunk_failure_reports_first_id(self, no_chunk_delay):
+        """第 2 段失败：仅第 1 段已发出——message_id=第 1 段 id，continuation 空。"""
+        async with running_adapter(max_msg_chars=12) as (adapter, harness):
+            fake = await harness.dial_bot()
+            _counter_ids(fake)
+            fake.fail_on_call = {"send_msg": {2}}
+            result = await adapter.send(OTHER_USER, "第一句话。" * 6)
+            assert result.success is False
+            assert result.retryable is False
+            assert result.message_id == "1001"
+            assert result.continuation_message_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_failure_keeps_retryable_passthrough(self, no_chunk_delay):
+        """首段即失败：未发出任何段，retryable 原样透传（API 失败 → False）。"""
+        async with running_adapter(max_msg_chars=12) as (adapter, harness):
+            fake = await harness.dial_bot()
+            _counter_ids(fake)
+            fake.fail_on_call = {"send_msg": {1}}
+            result = await adapter.send(OTHER_USER, "第一句话。" * 6)
+            assert result.success is False
+            assert result.retryable is False  # OneBotApiError 的透传值
+            assert result.message_id is None
+            assert result.continuation_message_ids == ()
+            assert len(fake.requests_for("send_msg")) == 1  # 未继续发后续段
 
 
 # ---------------------------------------------------------------------------

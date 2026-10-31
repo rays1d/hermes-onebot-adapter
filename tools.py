@@ -28,7 +28,7 @@ import logging
 import weakref
 from typing import Any, Dict, Optional
 
-from .adapter import NetworkError, NotConnectedError, OneBotApiError
+from .adapter import NetworkError, NotConnectedError, OneBotApiError, UnknownOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +232,12 @@ async def _do_onebot_call(
     except NotConnectedError as exc:
         return {"error": f"OneBot action '{action}' failed: {exc}", "retryable": True}
     except NetworkError as exc:
-        return {"error": f"OneBot action '{action}' timed out or the link failed: {exc}"}
+        return {"error": f"OneBot action '{action}' failed before submission: {exc}",
+                "retryable": True}
+    except UnknownOutcome as exc:
+        return {"error": f"OneBot action '{action}' outcome unknown: {exc} "
+                         "(may have been delivered; do not blindly retry)",
+                "outcome_unknown": True}
     except OneBotApiError as exc:
         return {"error": str(exc), "retcode": exc.retcode, "raw": exc.payload}
     except Exception as exc:  # pragma: no cover - 防御

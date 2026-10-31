@@ -139,6 +139,8 @@ class FakeNapCat:
     - 默认按 echo 回 ``{"status": "ok", "retcode": 0, "data": ...}``
     - ``hold_actions``：记录但不回（测超时 / 旧连接 pending 清理）
     - ``fail_actions``：回 ``status=failed``（测 OneBotApiError）
+    - ``fail_on_call`` / ``drop_on_call``：按「第 N 次调用」精确控场——前者回 failed，
+      后者收到即断开不回包（驱动「已提交后连接断开」路径）
     - ``action_data`` / ``action_handler``：自定义回包 data
     - ``push_event``：注入事件帧（无 echo，不触发自动回包）
     """
@@ -155,6 +157,9 @@ class FakeNapCat:
         self.responses_sent: list[dict] = []
         self.hold_actions: set[str] = set()
         self.fail_actions: set[str] = set()
+        self.fail_on_call: dict[str, set[int]] = {}  # action → 第 N 次调用回 failed（1 起）
+        self.drop_on_call: dict[str, set[int]] = {}  # action → 第 N 次调用后断开不回包
+        self._call_counts: dict[str, int] = {}
         self.custom_responses: dict[str, dict] = {}  # action → 完整响应体（echo 自动补）
         self.action_data: dict[str, dict] = {}
         self.action_handler = None  # callable(action, params) -> data dict
@@ -185,6 +190,18 @@ class FakeNapCat:
                 self.requests.append(frame)
                 if echo is None:
                     continue  # 事件帧：不回包
+                call_no = self._call_counts[action] = self._call_counts.get(action, 0) + 1
+                if call_no in self.drop_on_call.get(action, ()):
+                    # 收到即断开、不回包：服务端 pending 走「已提交后断开」清理路径
+                    with contextlib.suppress(Exception):
+                        await self.ws.close()
+                    return
+                if call_no in self.fail_on_call.get(action, ()):
+                    await self.send_response({
+                        "status": "failed", "retcode": 1200,
+                        "wording": f"fake failure #{call_no} for {action}", "echo": echo,
+                    })
+                    continue
                 if action in self.hold_actions:
                     continue
                 if action in self.custom_responses:
