@@ -33,6 +33,7 @@ import math
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
@@ -57,7 +58,17 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator
 
 from .formatting import QQ_TEXT_LIMIT, split_for_qq, strip_markdown
-from .segments import MediaRegistry, at_targets, extract_reply_id, parse_segments, render_text
+from .segments import (
+    MediaRef,
+    MediaRegistry,
+    at_targets,
+    extract_reply_id,
+    media_file,
+    media_size,
+    media_url,
+    parse_segments,
+    render_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +213,23 @@ def _file_uri(path: Path) -> str:
     return f"file://{normalized}"
 
 
+def _truncate_media_diag(data: Any, *, max_len: int = 60) -> str:
+    """诊断用：把媒体段 data 摘要成 "键=截断值" 列表；base64 只记长度，不落正文。"""
+    if not isinstance(data, dict):
+        return repr(data)[:max_len]
+    parts = []
+    for key in sorted(data):
+        value = data[key]
+        if isinstance(value, str):
+            if key.lower() == "base64":
+                parts.append(f"{key}=<base64:{len(value)} chars>")
+            else:
+                parts.append(f"{key}={value[:max_len]!r}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return "{" + ", ".join(parts) + "}"
+
+
 class OnebotAdapter(BasePlatformAdapter):
     """OneBot 11 反向 WebSocket 适配器（NapCat 等实现端作为 client 拨入）。
 
@@ -292,6 +320,8 @@ class OnebotAdapter(BasePlatformAdapter):
         self._self_id: Optional[str] = None
         self._last_heartbeat: float = 0.0
         self._registry: Optional[MediaRegistry] = None    # 最近一条消息的媒体注册表
+        # 注册表环：最近 10 条 (message_id, registry)——media_id 跨消息解析 + get_msg 兕底用
+        self._recent_media: "deque[tuple[str, MediaRegistry]]" = deque(maxlen=10)
         self._upload_unsupported: bool = False            # upload_file_stream 探测失败后永久回退
         # 最近一条通过门控的入站消息归属（tools.py 管理员档判定用）
         self._last_session_user: Optional[str] = None
@@ -326,6 +356,68 @@ class OnebotAdapter(BasePlatformAdapter):
     def current_registry(self) -> Optional[MediaRegistry]:
         """最近一条入站消息的媒体注册表（``onebot_call`` 工具按 media_id 查引用用）。"""
         return self._registry
+
+    async def resolve_media_ref(self, media_id: str) -> Optional[MediaRef]:
+        """media_id → :class:`MediaRef`：扫最近 10 条消息的注册表环，全空引用 get_msg 兜底。
+
+        1. 从新到旧找第一个含该 media_id 的注册表（media_id 是消息内短标记，
+           跨消息同号不同物——命中即停，不继续扫更旧注册表）；
+        2. 命中引用 url/file 任一非空 → 直接返回；
+        3. 命中但全空（实现端事件段未携带，如实测某些表情包图片）→ 用该消息
+           的 message_id 调 ``get_msg`` 从完整消息体补全 url/file 并就地回写；
+           get_msg 失败（任何异常）→ 返回原空引用，让上层报「缺 url/file」
+           而非「找不到」。
+
+        全部注册表都没有该 media_id → ``None``（标记过期/不属于最近 10 条）。
+        """
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            return None
+        for message_id, registry in reversed(self._recent_media):
+            ref = registry.get(media_id)
+            if ref is None:
+                continue
+            if not (ref.url or ref.file):
+                await self._backfill_media_ref(ref, message_id)
+            return ref
+        return None
+
+    async def _backfill_media_ref(self, ref: MediaRef, message_id: str) -> None:
+        """get_msg 兜底：从实现端完整消息体回写 url/file 到空引用（就地修改）。
+
+        同类型段优先（ref.type 匹配），无同类型段时退而取第一个媒体段；
+        任何失败静默返回（ref 保持原样，由上层给「缺 url/file」错误文案）。
+        """
+        if not message_id:
+            return
+        logger.info(
+            "[%s] media_id=%s 引用缺 url/file，get_msg(message_id=%s) 兜底补全",
+            self.name, ref.media_id, message_id)
+        try:
+            payload = await self._call_api("get_msg", {"message_id": int(message_id)})
+        except Exception as exc:
+            logger.info("[%s] get_msg 兜底失败（返回原引用）: %s", self.name, exc)
+            return
+        data = payload.get("data") if isinstance(payload, dict) else None
+        raw = data.get("message") if isinstance(data, dict) else None
+        segments = parse_segments(raw) if raw is not None else []
+        same_type = next((s for s in segments if s.type == ref.type), None)
+        media_seg = same_type or next(
+            (s for s in segments if s.type in ("image", "record", "video", "file")), None)
+        if media_seg is None:
+            logger.info("[%s] get_msg 回包无可用媒体段（返回原引用）", self.name)
+            return
+        logger.info("[%s] get_msg 兜底回包媒体段 data: %s",
+                    self.name, _truncate_media_diag(media_seg.data))
+        url = media_url(media_seg.data)
+        file_ref = media_file(media_seg.data)
+        if url and not ref.url:
+            ref.url = url
+        if file_ref and not ref.file:
+            ref.file = file_ref
+        size = media_size(media_seg.data)
+        if size is not None and ref.file_size is None:
+            ref.file_size = size
 
     @property
     def last_session_user(self) -> Optional[str]:
@@ -724,6 +816,7 @@ class OnebotAdapter(BasePlatformAdapter):
         # 每条消息一个新 MediaRegistry：media_id 计数重置（m1、m2、…）
         registry = MediaRegistry()
         self._registry = registry
+        self._recent_media.append((str(payload.get("message_id") or ""), registry))
 
         raw = payload.get("message")
         if raw is None or raw == "":

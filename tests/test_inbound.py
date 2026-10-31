@@ -402,3 +402,82 @@ class TestGroupPendingFollowup:
             await fake.push_event(group_event("回答澄清"))
             await settle()
             assert events == []
+
+
+# ---------------------------------------------------------------------------
+# 媒体注册表环 + get_msg 兜底（真机表情包取图失败的修复）
+# ---------------------------------------------------------------------------
+
+class TestMediaRegistryRing:
+    @pytest.mark.asyncio
+    async def test_media_id_resolves_across_messages(self, monkeypatch):
+        """图消息之后来了纯文本消息，旧 media_id 仍可解析（环保留 10 条）。"""
+        async with running_adapter(allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(private_event(
+                [{"type": "image", "data": {"url": "https://e.com/cat.jpg",
+                                            "file": "cat.jpg"}}], message_id=1001))
+            await wait_until(lambda: len(events) == 1)
+            await fake.push_event(private_event("第二条纯文本", message_id=1002))
+            await wait_until(lambda: len(events) == 2)
+            ref = await adapter.resolve_media_ref("m1")
+            assert ref is not None
+            assert ref.url == "https://e.com/cat.jpg"
+
+    @pytest.mark.asyncio
+    async def test_ring_eviction_after_ten_messages(self, monkeypatch):
+        async with running_adapter(allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(private_event(
+                [{"type": "image", "data": {"url": "https://e.com/cat.jpg"}}],
+                message_id=1001))
+            await wait_until(lambda: len(events) == 1)
+            for i in range(2, 13):  # 再来 11 条纯文本 → 最老的注册表被挤出
+                await fake.push_event(private_event(f"msg{i}", message_id=1000 + i))
+            await wait_until(lambda: len(events) == 12)
+            assert await adapter.resolve_media_ref("m1") is None
+
+    @pytest.mark.asyncio
+    async def test_empty_ref_backfilled_via_get_msg(self, monkeypatch, caplog):
+        """事件段缺 url/file（真机表情包场景）→ get_msg 兜底回写 url/file。"""
+        async with running_adapter(allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(private_event(
+                [{"type": "image", "data": {}}],  # 实现端没带 url/file
+                message_id=1001))
+            await wait_until(lambda: len(events) == 1)
+            assert adapter.current_registry().get("m1").url is None
+            fake.action_data["get_msg"] = {
+                "message_id": 1001,
+                "message": [{"type": "image", "data": {
+                    "url": "https://e.com/sticker.gif", "file": "stk.gif"}}],
+            }
+            ref = await adapter.resolve_media_ref("m1")
+            assert ref is not None
+            assert ref.url == "https://e.com/sticker.gif"
+            assert ref.file == "stk.gif"
+
+    @pytest.mark.asyncio
+    async def test_get_msg_failure_returns_original_ref(self, monkeypatch):
+        async with running_adapter(allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(private_event([{"type": "image", "data": {}}],
+                                                message_id=1001))
+            await wait_until(lambda: len(events) == 1)
+            fake.fail_actions.add("get_msg")  # 兜底失败不抛异常
+            ref = await adapter.resolve_media_ref("m1")
+            assert ref is not None
+            assert ref.url is None and ref.file is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_media_id_returns_none(self, monkeypatch):
+        async with running_adapter(allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(private_event("你好"))
+            await wait_until(lambda: len(events) == 1)
+            assert await adapter.resolve_media_ref("m9") is None

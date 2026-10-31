@@ -380,8 +380,13 @@ def make_adapter(**extra):
 
 
 def fake_live_adapter(*, connected: bool = True, admins=("10001",),
-                      session_user: str = "", registry=None, responses=None):
-    """tools.py 单元测试用的假 adapter（duck-typed，不依赖真实 WS）。"""
+                      session_user: str = "", registry=None, responses=None,
+                      recent_media=None):
+    """tools.py 单元测试用的假 adapter（duck-typed，不依赖真实 WS）。
+
+    ``recent_media``：[(message_id, registry), ...]——模拟 adapter 的注册表环，
+    提供时走 resolve_media_ref 新链路；未提供时仅有 current_registry（旧链路）。
+    """
     responses = responses if responses is not None else {}
     calls: list[tuple] = []
 
@@ -392,12 +397,22 @@ def fake_live_adapter(*, connected: bool = True, admins=("10001",),
         return {"status": "ok", "retcode": 0,
                 "data": responses.get(action) or {}, "echo": "9:1"}
 
-    return SimpleNamespace(
+    async def resolve_media_ref(media_id):
+        for _mid, reg in reversed(list(recent_media or [])):
+            ref = reg.get(media_id)
+            if ref is not None:
+                return ref
+        return None
+
+    ns_kwargs = dict(
         is_connected=connected, call_action=call_action, calls=calls,
         admin_users=tuple(admins), last_session_user=session_user,
         last_session_chat_id=None,
         current_registry=(lambda: registry) if registry is not None else None,
     )
+    if recent_media is not None:
+        ns_kwargs["resolve_media_ref"] = resolve_media_ref
+    return SimpleNamespace(**ns_kwargs)
 
 
 # importlib 导入模式下 conftest 以 "tests.conftest" 名字加载；给测试文件里

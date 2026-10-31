@@ -161,28 +161,176 @@ def _admin_verdict(adapter) -> Optional[str]:
 
 # ── media_id 桥接 ─────────────────────────────────────────────────────────────
 
-def _bridge_media_id(adapter, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """把 ``media_id`` 短标记还原成实现端的 ``file`` 引用；解析失败返回 None。
+_MAX_MEDIA_BYTES = 28 * 1024 * 1024  # 与 WS 帧上限同量级的下载护栏
 
-    入站媒体以 ``[图片:m1]`` 等内联标记呈现（segments.py 的 MediaRegistry，
-    按消息轮换）；``current_registry()`` 返回最近一条入站消息的注册表。
+
+def _sniff_image(raw: bytes) -> Optional[tuple[str, str]]:
+    """图片魔数嗅探 → (ext, mime)；不匹配返回 None。"""
+    if raw.startswith(bytes.fromhex("89504e470d0a1a0a")):
+        return ".png", "image/png"
+    if raw.startswith(bytes.fromhex("ffd8ff")):
+        return ".jpg", "image/jpeg"
+    if raw.startswith(b"GIF8"):
+        return ".gif", "image/gif"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    return None
+
+
+def _media_ext_mime(kind: str, ref: Any, url: str) -> tuple[str, str]:
+    """（扩展名, mime）推断：引用/URL 后缀优先，否则按媒体类型默认值。"""
+    from pathlib import Path
+    name = str(getattr(ref, "name", None) or "") or url.split("?")[0]
+    suffix = Path(name).suffix.lower()
+    defaults = {
+        "image": (".jpg", "image/jpeg"),
+        "record": (".wav", "audio/wav"),
+        "file": (".bin", "application/octet-stream"),
+        "video": (".mp4", "video/mp4"),
+    }
+    default_ext, default_mime = defaults.get(kind, defaults["file"])
+    if not suffix:
+        return default_ext, default_mime
+    import mimetypes
+    guessed = mimetypes.guess_type(name)[0]
+    return suffix, guessed or default_mime
+
+
+async def _bridge_media_ref(adapter, media_id: str) -> tuple[Optional[Any], str]:
+    """把 ``media_id`` 短标记解析成 :class:`MediaRef`；返回 (ref, 失败原因)。
+
+    成功时原因为空串。解析链（adapter.resolve_media_ref）：最近 10 条消息的
+    注册表环 → 命中但 url/file 全空时 get_msg 兜底补全。本函数只负责把失败
+    翻译成准确的报错文案（找不到 ≠ 引用存在但缺字段）。
     """
-    media_id = str(params.get("media_id") or "").strip()
-    if not media_id:
-        return params
-    registry_fn = getattr(adapter, "current_registry", None)
-    registry = registry_fn() if callable(registry_fn) else None
-    ref = registry.get(media_id) if registry is not None else None
+    resolver = getattr(adapter, "resolve_media_ref", None)
+    if not callable(resolver):  # 老版本适配器兼容：退回单条注册表
+        registry_fn = getattr(adapter, "current_registry", None)
+        registry = registry_fn() if callable(registry_fn) else None
+        return (registry.get(media_id) if registry is not None else None), (
+            f"media_id {media_id} not found in any recent message's media registry "
+            "(markers like [图片:m1] expire with newer inbound messages) — "
+            "refetch via get_msg / get_group_msg_history by message_id."
+        )
+    ref = await resolver(media_id)
     if ref is None:
+        return None, (
+            f"media_id {media_id} not found in any recent message's media registry "
+            "(the last 10 inbound messages are kept) — the marker may have expired; "
+            "refetch the media via get_msg / get_group_msg_history by message_id."
+        )
+    if not (ref.url or ref.file):
+        return None, (
+            f"media_id {media_id} resolves to a media reference without url/file "
+            "(the implementation's event segment carried neither, and the get_msg "
+            "fallback did not yield one) — ask the sender to resend, or fetch via "
+            "get_msg / get_group_msg_history by message_id."
+        )
+    return ref, ""
+
+
+async def _fetch_media_bytes(adapter, url: str) -> Optional[bytes]:
+    """从 URL 下载媒体字节（30s 超时、28MB 上限）；失败返回 None。"""
+    import aiohttp
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, follow_redirects=True) as resp:
+                resp.raise_for_status()
+                chunks = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > _MAX_MEDIA_BYTES:
+                        logger.warning("onebot_call: 媒体下载超过 %d 字节上限", _MAX_MEDIA_BYTES)
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    except Exception as exc:
+        logger.info("onebot_call: 媒体下载失败 url=%s: %s", url[:120], exc)
         return None
-    file_ref = ref.file or ref.url
-    if not file_ref:
-        return None
-    bridged = {key: value for key, value in params.items() if key != "media_id"}
-    bridged.setdefault("file", file_ref)
-    if ref.file_size is not None:
-        bridged.setdefault("file_size", ref.file_size)
-    return bridged
+
+
+def _cache_image_fn():
+    """可覆写的缓存取用器（测试注入用）：返回 async (data, ext) -> path。"""
+    from gateway.platforms.base import cache_image_from_bytes_async
+    return cache_image_from_bytes_async
+
+
+def _cache_audio_fn():
+    from gateway.platforms.base import cache_audio_from_bytes_async
+    return cache_audio_from_bytes_async
+
+
+def _cache_doc_fn():
+    from gateway.platforms.base import cache_document_from_bytes_async
+    return cache_document_from_bytes_async
+
+
+async def _localize_media(adapter, kind: str, ref: Any, data: Dict[str, Any]) -> None:
+    """get_image/get_record/get_file 成功后：把 base64/URL 落成本地缓存文件。
+
+    写回 ``data["local_file"]``（hermes 可读路径）与 ``data["mime"]``；失败
+    不谎报失败——保留原 url/base64，置 ``local_file=None`` 并附 ``fetch_error``。
+    """
+    raw: Optional[bytes] = None
+    b64 = data.get("base64")
+    if isinstance(b64, str) and b64:
+        import base64 as _base64
+        try:
+            payload = b64[9:] if b64.startswith("base64://") else b64
+            raw = _base64.b64decode(payload, validate=True)
+        except Exception as exc:
+            logger.info("onebot_call: base64 解码失败（转 URL 下载）: %s", exc)
+            raw = None
+    url = str(data.get("url") or getattr(ref, "url", None) or "")
+    if raw is None and url.startswith(("http://", "https://")):
+        raw = await _fetch_media_bytes(adapter, url)
+    if raw is None:
+        data.setdefault("local_file", None)
+        data.setdefault("fetch_error", "no usable base64/url or download failed")
+        return
+    if len(raw) > _MAX_MEDIA_BYTES:
+        data.setdefault("local_file", None)
+        data.setdefault("fetch_error", f"media exceeds {_MAX_MEDIA_BYTES} bytes")
+        return
+    ext, mime = _media_ext_mime(kind, ref, url)
+    if kind == "image":
+        sniffed = _sniff_image(raw)
+        if sniffed is not None:
+            ext, mime = sniffed
+    try:
+        if kind == "image":
+            path = await _cache_image_fn()(raw, ext)
+        elif kind == "record":
+            path = await _cache_audio_fn()(raw, ext)
+        else:
+            name = str(getattr(ref, "name", None) or f"onebot{ext}")
+            path = await _cache_doc_fn()(raw, name)
+    except Exception as exc:
+        data.setdefault("local_file", None)
+        data.setdefault("fetch_error", f"cache write failed: {exc}")
+        return
+    data["local_file"] = path
+    data["mime"] = mime
+
+
+def _strip_huge_base64(node: Any, *, depth: int = 0) -> Any:
+    """递归把超长 base64 字段替换为省略标记（历史类接口回包可能内嵌整图）。"""
+    if depth > 6:
+        return node
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if (isinstance(key, str) and key.lower() == "base64"
+                    and isinstance(value, str) and len(value) > 4096):
+                out[key] = f"<base64:{len(value)} chars omitted — use get_image/get_file to fetch>"
+            else:
+                out[key] = _strip_huge_base64(value, depth=depth + 1)
+        return out
+    if isinstance(node, list):
+        return [_strip_huge_base64(item, depth=depth + 1) for item in node]
+    return node
 
 
 # ── action 执行 ───────────────────────────────────────────────────────────────
@@ -216,16 +364,22 @@ async def _do_onebot_call(
     if not callable(call_action):
         return {"error": "OneBot adapter does not expose call_action(); upgrade the plugin."}
 
+    media_ref = None  # 桥接出的 MediaRef（媒体动作的后处理用）
     if action in _MEDIA_ACTIONS:
-        params = _bridge_media_id(adapter, params)
-        if params is None:
-            return {
-                "error": (
-                    "media_id not found in the current message's media registry — "
-                    "markers like [图片:m1] only resolve for the most recent inbound "
-                    "message; ask the sender to resend or use get_group_msg_history."
-                )
-            }
+        media_id = str((params or {}).get("media_id") or "").strip()
+        if media_id:
+            media_ref, reason = await _bridge_media_ref(adapter, media_id)
+            if media_ref is None:
+                return {"error": reason}
+            bridged = {key: value for key, value in params.items() if key != "media_id"}
+            bridged.setdefault("file", media_ref.file or media_ref.url)
+            if media_ref.file_size is not None:
+                bridged.setdefault("file_size", media_ref.file_size)
+            params = bridged
+            if action == "get_record":
+                params.setdefault("out_format", "wav")  # NapCat 服务端转码，无需本地 ffmpeg
+        else:
+            params = {key: value for key, value in (params or {}).items() if key != "media_id"}
 
     try:
         response = await call_action(action, params or {})
@@ -245,12 +399,22 @@ async def _do_onebot_call(
 
     if not isinstance(response, dict):
         return {"error": f"OneBot returned non-dict response: {type(response).__name__}"}
+    status = response.get("status", "ok")
+    retcode = response.get("retcode", 0)
+    data = response.get("data")
+    # 媒体动作：把 base64/URL 落成本地缓存文件，agent 可直接交给视觉/音频工具
+    if action in _MEDIA_ACTIONS and isinstance(data, dict) and status == "ok" and retcode == 0:
+        kind = "record" if action == "get_record" else (
+            "image" if action == "get_image" else "file")
+        ref = await _bridge_media_ref(adapter, str((params or {}).get("media_id") or "")) \
+            if (params or {}).get("media_id") else (None, "")
+        await _localize_media(adapter, kind, ref[0], data)
     return {
         "success": True,
         "action": action,
-        "status": response.get("status", "ok"),
-        "retcode": response.get("retcode", 0),
-        "data": response.get("data"),
+        "status": status,
+        "retcode": retcode,
+        "data": _strip_huge_base64(data),
     }
 
 

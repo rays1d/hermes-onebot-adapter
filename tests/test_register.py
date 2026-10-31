@@ -427,7 +427,7 @@ class TestMediaIdBridge:
         monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
         result = _handler_result(asyncio_run(tools._onebot_call_handler(
             {"action": "get_image", "params": {"media_id": "m9"}})))
-        assert "media_id not found" in result["error"]
+        assert "not found in any recent message's media registry" in result["error"]
         assert fake.calls == []  # 未发出任何 API 请求
 
     def test_no_registry_also_reports_error(self, monkeypatch):
@@ -435,7 +435,7 @@ class TestMediaIdBridge:
         monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
         result = _handler_result(asyncio_run(tools._onebot_call_handler(
             {"action": "get_record", "params": {"media_id": "m1"}})))
-        assert "media_id not found" in result["error"]
+        assert "not found in any recent message's media registry" in result["error"]
 
     def test_media_action_without_media_id_passes_through(self, monkeypatch):
         fake = fake_live_adapter()
@@ -454,6 +454,112 @@ class TestMediaIdBridge:
         assert result["success"] is True
         assert fake.calls[0][1] == {"out_format": "mp3", "file": "abc.jpg",
                                     "file_size": 1024}
+
+    # ── 新链路：resolve_media_ref（注册表环）+ 兑底 + 落地缓存 + 瘦身 ──
+
+    def _recent_fake(self, monkeypatch, ref, responses=None):
+        registry = MediaRegistry()
+        registry._refs[ref.media_id] = ref
+        registry._counter = 1
+        fake = fake_live_adapter(recent_media=[("111", registry)],
+                                 responses=responses or {})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        return fake
+
+    def test_ref_without_url_file_reports_missing_ref(self, monkeypatch):
+        from onebot_plugin.segments import MediaRef
+        ref = MediaRef(media_id="m1", type="image", url=None, file=None)
+        fake = self._recent_fake(monkeypatch, ref)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        assert "without url/file" in result["error"]
+        assert fake.calls == []  # 缺引用时不发请求
+
+    def test_get_record_defaults_to_wav(self, monkeypatch):
+        from onebot_plugin.segments import MediaRef
+        ref = MediaRef(media_id="m1", type="record", url="https://e.com/a",
+                       file="abc", file_size=10)
+        fake = self._recent_fake(monkeypatch, ref)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_record", "params": {"media_id": "m1"}})))
+        assert result["success"] is True
+        assert fake.calls[0][1]["out_format"] == "wav"
+
+    def test_get_image_base64_becomes_local_file(self, monkeypatch, tmp_path):
+        from onebot_plugin.segments import MediaRef
+        png = bytes.fromhex("89504e470d0a1a0a") + b"rest"
+        import base64 as b64mod
+        ref = MediaRef(media_id="m1", type="image", url=None, file="abc")
+        fake = self._recent_fake(
+            monkeypatch, ref,
+            responses={"get_image": {"file": "abc", "base64": b64mod.b64encode(png).decode()}})
+        cached = tmp_path / "img.png"
+
+        async def fake_cache(data, ext=".jpg"):
+            cached.write_bytes(data)
+            return str(cached)
+
+        monkeypatch.setattr(tools, "_cache_image_fn", lambda: fake_cache)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        assert result["success"] is True
+        assert result["data"]["local_file"] == str(cached)
+        assert result["data"]["mime"] == "image/png"
+        assert cached.read_bytes() == png
+
+    def test_get_image_url_download_localized(self, monkeypatch, tmp_path):
+        from onebot_plugin.segments import MediaRef
+        png = bytes.fromhex("89504e470d0a1a0a") + b"x"
+        ref = MediaRef(media_id="m1", type="image", url="https://e.com/a.png", file=None)
+        fake = self._recent_fake(
+            monkeypatch, ref, responses={"get_image": {"url": "https://e.com/a.png"}})
+        cached = tmp_path / "dl.png"
+
+        async def fake_fetch(adapter_, url):
+            return png
+
+        async def fake_cache(data, ext=".jpg"):
+            cached.write_bytes(data)
+            return str(cached)
+
+        monkeypatch.setattr(tools, "_fetch_media_bytes", fake_fetch)
+        monkeypatch.setattr(tools, "_cache_image_fn", lambda: fake_cache)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        assert result["data"]["local_file"] == str(cached)
+        assert result["data"]["mime"] == "image/png"
+
+    def test_get_image_download_failure_keeps_success(self, monkeypatch):
+        from onebot_plugin.segments import MediaRef
+        ref = MediaRef(media_id="m1", type="image", url="https://e.com/a.png", file=None)
+        fake = self._recent_fake(
+            monkeypatch, ref, responses={"get_image": {"url": "https://e.com/a.png"}})
+
+        async def fail_fetch(adapter_, url):
+            return None
+
+        monkeypatch.setattr(tools, "_fetch_media_bytes", fail_fetch)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_image", "params": {"media_id": "m1"}})))
+        # 不谎报失败：整体 success 保留，local_file 置空并附 fetch_error
+        assert result["success"] is True
+        assert result["data"]["local_file"] is None
+        assert result["data"]["fetch_error"]
+        assert result["data"]["url"] == "https://e.com/a.png"
+
+    def test_history_base64_stripped(self, monkeypatch):
+        fake = fake_live_adapter(responses={"get_friend_msg_history": {
+            "messages": [{"message": [{"type": "image",
+                                       "data": {"base64": "B" * 9000,
+                                                "url": "https://e.com/a.jpg"}}]}],
+        }})
+        monkeypatch.setattr(tools, "_get_onebot_adapter", lambda: fake)
+        result = _handler_result(asyncio_run(tools._onebot_call_handler(
+            {"action": "get_friend_msg_history",
+             "params": {"user_id": 1, "count": 5}})))
+        seg = result["data"]["messages"][0]["message"][0]["data"]
+        assert "omitted" in seg["base64"]
+        assert seg["url"] == "https://e.com/a.jpg"  # 小字段不动
 
 
 class TestToolVisibility:

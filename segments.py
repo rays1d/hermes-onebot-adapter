@@ -25,6 +25,9 @@ __all__ = [
     "Segment",
     "at_targets",
     "extract_reply_id",
+    "media_file",
+    "media_size",
+    "media_url",
     "parse_segments",
     "render_segments",
     "render_text",
@@ -230,22 +233,22 @@ def render_text(segment: Segment, media_registry: MediaRegistry) -> str:
     if seg_type == "reply":
         return ""
     if seg_type == "image":
-        media_id = media_registry.register("image", url=_media_url(data), file=_media_file(data),
-                                           file_size=_media_size(data))
+        media_id = media_registry.register("image", url=media_url(data), file=media_file(data),
+                                           file_size=media_size(data))
         return f"[图片:{media_id}]"
     if seg_type == "record":
-        media_id = media_registry.register("record", url=_media_url(data), file=_media_file(data),
-                                           file_size=_media_size(data))
+        media_id = media_registry.register("record", url=media_url(data), file=media_file(data),
+                                           file_size=media_size(data))
         return f"[语音:{media_id}]"
     if seg_type == "video":
-        media_id = media_registry.register("video", url=_media_url(data), file=_media_file(data),
-                                           file_size=_media_size(data))
+        media_id = media_registry.register("video", url=media_url(data), file=media_file(data),
+                                           file_size=media_size(data))
         return f"[视频:{media_id}]"
     if seg_type == "file":
         name = _file_name(data)
-        media_id = media_registry.register("file", url=_media_url(data),
-                                           file=_media_file(data) or data.get("file_id"),
-                                           file_size=_media_size(data), name=name)
+        media_id = media_registry.register("file", url=media_url(data),
+                                           file=media_file(data) or data.get("file_id"),
+                                           file_size=media_size(data), name=name)
         return f"[文件:{name}:{media_id}]" if name else f"[文件:{media_id}]"
     # 未知段类型：原样保留（见模块 docstring），渲染回退占位
     return f"[{seg_type}]"
@@ -256,17 +259,17 @@ def render_segments(segments: list[Segment], media_registry: MediaRegistry) -> s
     return "".join(render_text(seg, media_registry) for seg in segments)
 
 
-def _media_url(data: dict) -> str | None:
+def media_url(data: dict) -> str | None:
     url = data.get("url")
     return str(url) if url else None
 
 
-def _media_file(data: dict) -> str | None:
+def media_file(data: dict) -> str | None:
     value = data.get("file") or data.get("file_id")
     return str(value) if value else None
 
 
-def _media_size(data: dict) -> int | None:
+def media_size(data: dict) -> int | None:
     value = data.get("file_size", data.get("size"))
     if isinstance(value, bool):
         return None
