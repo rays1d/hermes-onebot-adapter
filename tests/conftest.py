@@ -128,6 +128,15 @@ async def settle(seconds: float = 0.15) -> None:
     await asyncio.sleep(seconds)
 
 
+def api_requests(fake: "FakeNapCat") -> list[dict]:
+    """排除连接期身份探针后的 action 帧。
+
+    连接建立后 adapter 会主动发一次 ``get_login_info``（身份确认，属连接
+    生命周期而非消息处理）；「门控拒绝 ⇒ 零 API 请求」类断言应排除它。
+    """
+    return [f for f in fake.requests if f.get("action") != "get_login_info"]
+
+
 # ---------------------------------------------------------------------------
 # FakeNapCat：真实 WS client，拨入 adapter 的 server
 # ---------------------------------------------------------------------------

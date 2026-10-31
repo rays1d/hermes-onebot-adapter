@@ -12,7 +12,13 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp import web
 
-from conftest import GROUP_ID, OTHER_USER, free_port, running_adapter
+from conftest import (
+    GROUP_ID,
+    OTHER_USER,
+    api_requests,
+    free_port,
+    running_adapter,
+)
 from gateway.config import PlatformConfig
 from onebot_plugin import standalone as standalone_mod
 from onebot_plugin.formatting import QQ_TEXT_LIMIT, split_for_qq, strip_markdown
@@ -179,7 +185,7 @@ class TestSendText:
             fake = await harness.dial_bot()
             result = await adapter.send(OTHER_USER, "``` ```")
             assert result.success is True
-            assert fake.requests == []
+            assert api_requests(fake) == []
 
     @pytest.mark.asyncio
     async def test_long_text_split_with_continuation_ids(self, no_chunk_delay):

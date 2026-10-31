@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Optional
 
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge,
@@ -115,6 +116,37 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     return _apply_yaml_bridge(platform_cfg, YAML_TABLE)
 
 
+# ── send_message 目标解析（parse_target_ref_fn 注册键）─────────────────────────
+
+def parse_target_ref(value: str) -> tuple[str, Optional[str]] | None:
+    """``send_message`` 目标引用 → ``(规范化 chat_id, thread_id)``；解析不了返回 None。
+
+    规范化与入站 ``build_source`` 一致：群 = ``group:<gid>``、私聊 = 纯 QQ 号。
+    支持形态：
+
+        onebot:group:123 / group:123                       → ("group:123", None)
+        onebot:123456 / 123456                             → ("123456", None)  # 纯数字=私聊
+        onebot:private:123 / private:123 / user:123 / dm:123 → ("123", None)
+
+    带前缀的形态按显式意图接受非数字 id；裸形态只认纯数字（非数字文本交还
+    通用解析/通道目录兜底，避免把群名误当 QQ 号）。OneBot v11 无 thread 概念，
+    thread_id 恒为 None。
+    """
+    raw = str(value or "").strip()
+    if raw.lower().startswith("onebot:"):
+        raw = raw[len("onebot:"):].strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("group:"):
+        target = raw.split(":", 1)[1].strip()
+        return (f"group:{target}", None) if target else None
+    if lowered.startswith(("private:", "user:", "dm:")):
+        target = raw.split(":", 1)[1].strip()
+        return (target, None) if target else None
+    return (raw, None) if raw.isdigit() else None
+
+
 # ── adapter 工厂 ──────────────────────────────────────────────────────────────
 
 def _build_adapter(config) -> OnebotAdapter:
@@ -148,6 +180,9 @@ def register(ctx) -> None:
         standalone_sender_fn=_standalone_send,
         allowed_users_env="ONEBOT_ALLOWED_USERS",
         allow_all_env="ONEBOT_ALLOW_ALL_USERS",
+        parse_target_ref_fn=parse_target_ref,
+        dashboard_description=(
+            "通过 OneBot v11（NapCat 等）连接 QQ，支持私聊/群聊/媒体/定时投递"),
         max_message_length=QQ_TEXT_LIMIT * 2,
         emoji="🐧",
         pii_safe=False,

@@ -169,6 +169,11 @@ class TestRegister:
         assert kwargs["standalone_sender_fn"] is _standalone_send
         assert kwargs["allowed_users_env"] == "ONEBOT_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "ONEBOT_ALLOW_ALL_USERS"
+        assert kwargs["parse_target_ref_fn"] is plugin.parse_target_ref
+        assert kwargs["dashboard_description"] == (
+            "通过 OneBot v11（NapCat 等）连接 QQ，支持私聊/群聊/媒体/定时投递")
+        # allow_update_command 默认即 True（platform_registry.PlatformEntry），无需注册
+        assert "allow_update_command" not in kwargs
         assert kwargs["max_message_length"] == QQ_TEXT_LIMIT * 2
         assert kwargs["emoji"] == "🐧"
         assert kwargs["pii_safe"] is False
@@ -201,6 +206,51 @@ class TestRegister:
     def test_check_fn_passive_probe(self):
         # 被动探测：aiohttp 可导入即 True；绝不安装东西
         assert check_onebot_requirements() is True
+
+
+# ---------------------------------------------------------------------------
+# parse_target_ref（send_message 目标解析，parse_target_ref_fn 注册键）
+# ---------------------------------------------------------------------------
+
+class TestParseTargetRef:
+    def test_platform_qualified_group(self):
+        assert plugin.parse_target_ref("onebot:group:123") == ("group:123", None)
+
+    def test_platform_qualified_digits_are_private(self):
+        assert plugin.parse_target_ref("onebot:123456") == ("123456", None)
+
+    def test_bare_group_ref(self):
+        assert plugin.parse_target_ref("group:123") == ("group:123", None)
+
+    def test_bare_digits_are_private(self):
+        assert plugin.parse_target_ref("123456") == ("123456", None)
+
+    def test_private_user_dm_prefixes_normalize_to_plain_id(self):
+        # 私聊规范化与 build_source 一致：纯 QQ 号，不带前缀
+        for ref in ("private:999", "user:999", "dm:999", "onebot:private:999"):
+            assert plugin.parse_target_ref(ref) == ("999", None), ref
+
+    def test_whitespace_tolerated(self):
+        assert plugin.parse_target_ref("  onebot: group:123 ") == ("group:123", None)
+        assert plugin.parse_target_ref(" 123456 ") == ("123456", None)
+
+    def test_group_ref_keeps_non_numeric_target(self):
+        # 带前缀 = 显式意图：group: 后的非数字 id 也接受（发送时由实现端判错）
+        assert plugin.parse_target_ref("group:abc") == ("group:abc", None)
+
+    def test_unparseable_returns_none(self):
+        assert plugin.parse_target_ref("") is None
+        assert plugin.parse_target_ref(None) is None
+        assert plugin.parse_target_ref("张三的群") is None  # 交还通道目录兜底
+        assert plugin.parse_target_ref("group:") is None
+        assert plugin.parse_target_ref("onebot:") is None
+        assert plugin.parse_target_ref("onebot:group:") is None
+        assert plugin.parse_target_ref("onebot:private:") is None
+        assert plugin.parse_target_ref("onebot:张三") is None
+
+    def test_thread_id_always_none(self):
+        # OneBot v11 无 thread 概念
+        assert plugin.parse_target_ref("onebot:group:123")[1] is None
 
 
 # ---------------------------------------------------------------------------

@@ -225,6 +225,7 @@ class OnebotAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False  # OneBot 11 无编辑消息动作
     splits_long_messages = True       # 出站长文由本适配器自行分段
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    IDENTITY_CONFIRM_TIMEOUT = 15.0   # 连接建立后主动确认身份的等待秒数
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("onebot"))
@@ -468,6 +469,33 @@ class OnebotAdapter(BasePlatformAdapter):
                 pass
             self._runner = None
 
+    async def _confirm_identity(self) -> None:
+        """连接建立后主动调 ``get_login_info`` 提前确认机器人 QQ 号（self_id）。
+
+        原状是被动等实现端的首帧 lifecycle 才知道 self_id——不发 lifecycle 的
+        实现端会一直处于未知身份状态、群 @ 触发判断失效。此处在连接建立后
+        主动问一次：成功且 ``data.user_id`` 存在则提前拿到；失败（超时/断开/
+        实现端报错）**不判死刑**——仅告警并保持已连接状态，等首帧 lifecycle
+        兜底。后到的 lifecycle 帧仍以新值覆盖（``_handle_meta`` 语义不变），
+        两条路径不冲突。
+        """
+        try:
+            data = await self._call_api_data(
+                "get_login_info", {}, timeout=self.IDENTITY_CONFIRM_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[%s] 身份确认失败（%s），等待首帧 lifecycle 兜底", self.name, exc)
+            return
+        self_id = str(data.get("user_id") or "").strip()
+        if not self_id:
+            logger.warning("[%s] 身份确认回包缺 user_id，等待首帧 lifecycle 兜底", self.name)
+            return
+        changed = self_id != self._self_id
+        self._self_id = self_id
+        if changed:
+            logger.info("[%s] OneBot 身份确认 self_id=%s", self.name, self_id)
+
     def _fail_pending_for(self, ws: Any, reason: str) -> None:
         """只清掉「写在给定连接上」的 pending——新连接的请求不受旧连接 teardown 影响。
 
@@ -542,6 +570,8 @@ class OnebotAdapter(BasePlatformAdapter):
 
         logger.info("[%s] OneBot 实现已连接 remote=%s self_id=%s generation=%d",
                     self.name, request.remote, self._self_id, self._generation)
+        # 主动身份确认：不等首帧 lifecycle，提前拿 self_id（失败不判死刑）
+        self._spawn(self._confirm_identity())
 
         try:
             async for msg in ws:
@@ -714,10 +744,20 @@ class OnebotAdapter(BasePlatformAdapter):
         reply_id = extract_reply_id(segments)
         quoted = await self._fetch_quoted_message(reply_id, registry) if reply_id else None
 
+        sender_name = (str(sender.get("card") or "").strip()
+                       or str(sender.get("nickname") or "").strip())
+        user_name = sender_name or None
+
         if chat_type == "group":
             triggered = mentioned
             if not triggered and quoted is not None and self._self_id:
                 triggered = quoted.get("sender_id") == self._self_id
+            if (not triggered and text
+                    and self._group_pending_prompt(group_id, user_id, user_name, msg_key)):
+                # 群内待答穿透：agent 的澄清提示还挂着，裸回答（不 @）也算触发
+                logger.debug("[%s] 群消息命中待答澄清提示，放行 group_id=%s user_id=%s",
+                             self.name, group_id, user_id)
+                triggered = True
             if not triggered:
                 logger.debug("[%s] 群消息未触发（未 @ 机器人且非回复机器人）group_id=%s user_id=%s",
                              self.name, group_id, user_id)
@@ -725,8 +765,6 @@ class OnebotAdapter(BasePlatformAdapter):
             if not text:
                 logger.debug("[%s] 群消息已触发但无文本内容，忽略", self.name)
                 return
-            sender_name = (str(sender.get("card") or "").strip()
-                           or str(sender.get("nickname") or "").strip())
             if sender_name:
                 text = f"{sender_name}：\n{text}"  # 群共享会话：带发送者前缀便于区分
         else:
@@ -734,8 +772,6 @@ class OnebotAdapter(BasePlatformAdapter):
                 logger.debug("[%s] 私聊消息无文本内容，忽略", self.name)
                 return
 
-        user_name = (str(sender.get("card") or "").strip()
-                     or str(sender.get("nickname") or "").strip() or None)
         chat_id = f"group:{group_id}" if chat_type == "group" else user_id
         # 工具层管理员归属：记录最近一次通过门控的调用者与所属会话
         self._last_session_user = user_id
@@ -797,6 +833,30 @@ class OnebotAdapter(BasePlatformAdapter):
         quoted_text = "".join(render_text(seg, registry) for seg in parse_segments(raw)).strip()
         text = f"[{sender_name}] {quoted_text}" if sender_name else quoted_text
         return {"sender_id": sender_id, "sender_name": sender_name or None, "text": text}
+
+    def _group_pending_prompt(self, group_id: str, user_id: str,
+                              user_name: Optional[str], message_id: str) -> bool:
+        """群内待答穿透：未 @ 机器人的群消息，若其会话仍有挂起的澄清提示，也视为触发。
+
+        否则 agent 在群里发起 clarify 后，用户的裸回答（不 @）会走未触发路径
+        被丢弃、提示悬死。调用前提：该消息已过 ``_authorize`` 门控（权限绝不
+        因 pending 放松，未过门控的消息根本走不到这里）；session key 用
+        provisional source 走 ``_event_session_key`` 派生，与网关处理真实消息
+        时的派生完全一致。任何导入/查询失败都按「无提示」处理（fail-closed：
+        可选状态缺失时绝不放行）。
+        """
+        try:
+            source = self.build_source(
+                chat_id=f"group:{group_id}", chat_type="group", user_id=user_id,
+                user_name=user_name, message_id=message_id)
+            session_key = self._event_session_key(
+                MessageEvent(text="", source=source, message_id=message_id))
+            from tools.clarify_gateway import get_pending_for_session
+            pending = get_pending_for_session(session_key, include_choice_prompts=True)
+        except Exception:
+            logger.debug("[%s] 群内待答提示查询失败，按未触发处理", self.name, exc_info=True)
+            return False
+        return pending is not None
 
     # ------------------------------------------------------------------
     # OneBot action 通道（echo / future）

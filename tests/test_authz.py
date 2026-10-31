@@ -15,6 +15,7 @@ from conftest import (
     OTHER_USER,
     OTHER_USER2,
     SELF_ID,
+    api_requests,
     group_event,
     install_message_handler,
     make_adapter,
@@ -154,7 +155,7 @@ class TestAuthzIntegration:
                 await fake.push_event(private_event("让我进", user_id=OTHER_USER))
                 await settle()
             assert events == []
-            assert fake.requests == []
+            assert api_requests(fake) == []
             # 日志给出可复制的完整 QQ 号与配置提示
             messages = " | ".join(r.message for r in caplog.records)
             assert str(int(OTHER_USER)) in messages

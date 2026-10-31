@@ -19,6 +19,7 @@ from conftest import (
     TEST_TOKEN,
     FakeNapCat,
     running_adapter,
+    wait_until,
 )
 from onebot_plugin.adapter import (
     NetworkError,
@@ -51,15 +52,18 @@ class TestEchoMatching:
     async def test_concurrent_calls_get_distinct_echos(self):
         async with running_adapter() as (adapter, harness):
             fake = await harness.dial_bot()
+            # 连接期身份探针先发一个 get_login_info（先让它走完，再对齐序号断言）
+            await fake.wait_action("get_login_info")
+            n0 = len(fake.requests)
             results = await asyncio.gather(
                 adapter._call_api("get_login_info", {}),
                 adapter._call_api("get_status", {}),
                 adapter._call_api("get_version_info", {}),
             )
             assert all(r["status"] == "ok" for r in results)
-            echoes = [f["echo"] for f in fake.requests]
+            echoes = [f["echo"] for f in fake.requests[n0:]]
             assert len(set(echoes)) == 3
-            assert [int(e.split(":")[1]) for e in echoes] == [1, 2, 3]
+            assert [int(e.split(":")[1]) for e in echoes] == [n0 + 1, n0 + 2, n0 + 3]
 
     @pytest.mark.asyncio
     async def test_submitted_timeout_raises_unknown_outcome_and_cleans_pending(self):
@@ -239,6 +243,91 @@ class TestConnectionLifecycle:
                 "self_id": SELF_ID})
             await asyncio.sleep(0.05)
             assert adapter._last_heartbeat > 0
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_overrides_early_probe(self):
+        """探针先拿到 A、后到 lifecycle 报 B：以 lifecycle 新值为准（两路径不冲突）。"""
+        async with running_adapter() as (adapter, harness):
+            fake = FakeNapCat(harness.url, TEST_TOKEN)
+            fake.custom_responses["get_login_info"] = {
+                "status": "ok", "retcode": 0, "data": {"user_id": 999999}}
+            await fake.connect()
+            await wait_until(lambda: adapter._live_ws() is not None)
+            await wait_until(lambda: adapter.self_id == "999999")  # 探针先拿到
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "lifecycle",
+                "sub_type": "connect", "self_id": SELF_ID})
+            await wait_until(lambda: adapter.self_id == SELF_ID)  # lifecycle 覆盖
+            await fake.close()
+
+
+class TestIdentityConfirmation:
+    """连接建立后的主动身份确认（get_login_info 探针）。"""
+
+    @pytest.mark.asyncio
+    async def test_probe_sent_on_connect_and_self_id_available_immediately(self):
+        """拨入即探针；回包 user_id → self_id 无需等 lifecycle 即可用。"""
+        async with running_adapter() as (adapter, harness):
+            fake = FakeNapCat(harness.url, TEST_TOKEN)
+            fake.action_data["get_login_info"] = {
+                "user_id": int(SELF_ID), "nickname": "bot"}
+            await fake.connect()
+            await wait_until(lambda: adapter._live_ws() is not None)
+            assert adapter.self_id is None  # lifecycle 未到，尚未知情
+            frame = await fake.wait_action("get_login_info")
+            assert frame["params"] == {}
+            await wait_until(lambda: adapter.self_id == SELF_ID)  # 探针提前拿到
+            await fake.close()
+
+    @pytest.mark.asyncio
+    async def test_probe_timeout_keeps_connection_alive(self, monkeypatch):
+        """探针超时不判死刑：连接保持，后续事件照常处理（等 lifecycle 兑底）。"""
+        from onebot_plugin.adapter import OnebotAdapter
+        monkeypatch.setattr(OnebotAdapter, "IDENTITY_CONFIRM_TIMEOUT", 0.2)
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial()
+            fake.hold_actions.add("get_login_info")  # 探针不回包 → 超时
+            await asyncio.sleep(0.3)  # > 探针 timeout，确认告警路径已走完
+            assert adapter.self_id is None
+            assert adapter._live_ws() is not None and not fake.ws.closed  # 连接仍存活
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "lifecycle",
+                "sub_type": "connect", "self_id": SELF_ID})
+            await wait_until(lambda: adapter.self_id == SELF_ID)  # lifecycle 兑底
+            await fake.push_event({  # 连接能继续收发：心跳帧仍进入分派
+                "post_type": "meta_event", "meta_event_type": "heartbeat",
+                "self_id": SELF_ID})
+            await wait_until(lambda: adapter._last_heartbeat > 0)
+
+    @pytest.mark.asyncio
+    async def test_probe_api_failure_keeps_connection_alive(self, monkeypatch):
+        """实现端对探针回 failed：同样不判死刑，只告警并保持连接。"""
+        from onebot_plugin.adapter import OnebotAdapter
+        monkeypatch.setattr(OnebotAdapter, "IDENTITY_CONFIRM_TIMEOUT", 1.0)
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial()
+            fake.fail_actions.add("get_login_info")
+            await asyncio.sleep(0.2)
+            assert adapter._live_ws() is not None and not fake.ws.closed
+            assert adapter.self_id is None  # 未拿到身份，等 lifecycle
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "lifecycle",
+                "sub_type": "connect", "self_id": SELF_ID})
+            await wait_until(lambda: adapter.self_id == SELF_ID)
+
+    @pytest.mark.asyncio
+    async def test_probe_response_without_user_id_ignored(self):
+        """回包缺 user_id（怪实现端）：不写入空值 self_id，等 lifecycle。"""
+        async with running_adapter() as (adapter, harness):
+            fake = await harness.dial()
+            fake.custom_responses["get_login_info"] = {
+                "status": "ok", "retcode": 0, "data": {"nickname": "bot"}}
+            await asyncio.sleep(0.2)
+            assert adapter.self_id is None
+            await fake.push_event({
+                "post_type": "meta_event", "meta_event_type": "lifecycle",
+                "sub_type": "connect", "self_id": SELF_ID})
+            await wait_until(lambda: adapter.self_id == SELF_ID)
 
 
 # ---------------------------------------------------------------------------

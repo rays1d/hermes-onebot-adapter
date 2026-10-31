@@ -13,6 +13,7 @@ from conftest import (
     OTHER_USER,
     OTHER_USER2,
     SELF_ID,
+    api_requests,
     group_event,
     install_message_handler,
     private_event,
@@ -68,7 +69,7 @@ class TestPrivateInbound:
             await settle()
             assert events == []
             # 实现端没有被发过任何 API 请求（门控先行，连 get_msg 都不碰）
-            assert fake.requests == []
+            assert api_requests(fake) == []
 
     @pytest.mark.asyncio
     async def test_self_message_filtered(self, monkeypatch):
@@ -242,7 +243,7 @@ class TestGroupTrigger:
             ]))
             await settle()
             assert events == []
-            assert fake.requests == []  # 门控先行：白名单外连 get_msg 都不发
+            assert api_requests(fake) == []  # 门控先行：白名单外连 get_msg 都不发
 
 
 # ---------------------------------------------------------------------------
@@ -267,3 +268,137 @@ class TestQuotedMessage:
             assert event.reply_to_author_id == str(int(OTHER_USER2))
             assert event.reply_to_author_name == "小明"
             assert event.reply_to_is_own_message is False
+
+
+# ---------------------------------------------------------------------------
+# 群内待答穿透（clarify pending → 未 @ 的回答也触发）
+# ---------------------------------------------------------------------------
+
+class TestGroupPendingFollowup:
+    """agent 在群里发起澄清后，用户的裸回答（不 @ 机器人）也必须到达网关。
+
+    穿透只发生在已过门控的消息上（权限不放松）；查询失败按「无提示」
+    fail-closed。session key 用与 ``_group_pending_prompt`` 同款的 provisional
+    派生（build_source 同参数 + ``_event_session_key``）。
+    """
+
+    @staticmethod
+    def _pending_key(adapter, user_id: str) -> str:
+        from gateway.platforms.event import MessageEvent
+        source = adapter.build_source(
+            chat_id=f"group:{GROUP_ID}", chat_type="group", user_id=str(user_id),
+            user_name=f"u{user_id}", message_id="pending")
+        return adapter._event_session_key(
+            MessageEvent(text="", source=source, message_id="pending"))
+
+    @pytest.fixture(autouse=True)
+    def _clear_clarify_state(self):
+        from tools import clarify_gateway
+        yield
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_group_answer_reaches_agent_when_pending(
+            self, monkeypatch):
+        """门控放行 + 群内 + 未 @ + 有待答澄清 → 视为触发进网关。"""
+        from tools import clarify_gateway
+        async with running_adapter(**GATE_EXTRA) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            key = self._pending_key(adapter, OTHER_USER)
+            clarify_gateway.register("cl-test", key, "选 A 还是 B？", None)
+            await fake.push_event(group_event("A"))  # 未 @、未回复 bot
+            await wait_until(lambda: len(events) == 1)
+            event = events[0]
+            assert event.text == f"u{OTHER_USER}：\nA"  # 昵称前缀照加
+            # provisional 派生与真实事件一致——这是穿透能命中的前提
+            assert adapter._event_session_key(event) == key
+
+    @pytest.mark.asyncio
+    async def test_no_pending_plain_group_message_still_ignored(self, monkeypatch):
+        """无待答提示时维持原判：未 @ 的群消息仍是闲聊，不误放。"""
+        from tools import clarify_gateway
+        async with running_adapter(**GATE_EXTRA) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            assert clarify_gateway.get_pending_for_session(
+                self._pending_key(adapter, OTHER_USER)) is None
+            await fake.push_event(group_event("今天天气不错"))
+            await settle()
+            assert events == []
+
+    @pytest.mark.asyncio
+    async def test_resolved_pending_no_longer_passes(self, monkeypatch):
+        """pending 已被回答并收割后穿透关闭：后续裸消息回到原判。
+
+        生产里 ``wait_for_response`` 的等待线程被唤醒后随即把条目从索引
+        收割（见 clarify_gateway.wait_for_response）；测试里没有阻塞的
+        agent 线程，按同一逻辑手动收割。
+        """
+        from tools import clarify_gateway
+        async with running_adapter(**GATE_EXTRA) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            key = self._pending_key(adapter, OTHER_USER)
+            clarify_gateway.register("cl-test", key, "选 A 还是 B？", None)
+            assert clarify_gateway.resolve_gateway_clarify("cl-test", "A")
+            with clarify_gateway._lock:  # wait_for_response 收割路径的等价操作
+                clarify_gateway._entries.pop("cl-test", None)
+                ids = clarify_gateway._session_index.get(key) or []
+                if "cl-test" in ids:
+                    ids.remove("cl-test")
+                if not ids:
+                    clarify_gateway._session_index.pop(key, None)
+            await fake.push_event(group_event("今天天气不错"))
+            await settle()
+            assert events == []
+
+    @pytest.mark.asyncio
+    async def test_other_user_session_pending_does_not_pass(self, monkeypatch):
+        """群会话按成员隔离（group_sessions_per_user 默认开）：别人的待答不放行。"""
+        from tools import clarify_gateway
+        async with running_adapter(**GATE_EXTRA) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            clarify_gateway.register(
+                "cl-test", self._pending_key(adapter, OTHER_USER), "选 A 还是 B？", None)
+            await fake.push_event(group_event("我也答一个", user_id=OTHER_USER2))
+            await settle()
+            assert events == []
+
+    @pytest.mark.asyncio
+    async def test_gate_denied_user_pending_never_consulted(self, monkeypatch):
+        """权限不放松：门控拒绝的消息直接返回，pending 查询不执行、零 API 请求。"""
+        from tools import clarify_gateway
+        original = clarify_gateway.get_pending_for_session
+        consulted: list[str] = []
+
+        def spy(session_key, *, include_choice_prompts=False):
+            consulted.append(session_key)
+            return original(session_key, include_choice_prompts=include_choice_prompts)
+
+        monkeypatch.setattr(clarify_gateway, "get_pending_for_session", spy)
+        async with running_adapter(allowed_groups=GROUP_ID,
+                                   group_allowed_users=OTHER_USER) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            clarify_gateway.register(
+                "cl-test", self._pending_key(adapter, OTHER_USER2), "选 A 还是 B？", None)
+            await fake.push_event(group_event("放我答", user_id=OTHER_USER2))
+            await settle()
+            assert events == []
+            assert consulted == []  # 门控先行：pending 查询根本不发生
+            assert api_requests(fake) == []
+
+    @pytest.mark.asyncio
+    async def test_clarify_import_failure_fails_closed(self, monkeypatch):
+        """clarify 模块导入失败 → 静默维持原判（fail-closed，绝不放行）。"""
+        import sys
+        monkeypatch.setitem(sys.modules, "tools.clarify_gateway", None)
+        async with running_adapter(**GATE_EXTRA) as (adapter, harness):
+            fake = await harness.dial_bot()
+            events = install_message_handler(adapter, monkeypatch)
+            await fake.push_event(group_event("回答澄清"))
+            await settle()
+            assert events == []
