@@ -18,7 +18,8 @@ description: >
   streamed with `upload_file_stream` (NapCat v4.8.115+) and falls back to
   base64. Designed for cross-machine deployments (e.g. over an EasyTier
   mesh): no `file://` shortcuts, every media path is URL/stream based.
-author: hermes-projects
+author: rays1d
+homepage: https://github.com/rays1d/hermes-onebot-adapter
 requires_env:
   - name: ONEBOT_TOKEN
     description: "Shared secret authenticating the OneBot implementation's reverse-WS dial-in (Authorization: Bearer or ?access_token=) — must match the access token of the WebSocket-client item configured in NapCat (or the equivalent in other OneBot implementations)"
