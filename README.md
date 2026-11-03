@@ -48,10 +48,10 @@ cp -r hermes-onebot-adapter ~/.hermes/plugins/onebot
 ln -s /path/to/hermes-onebot-adapter ~/.hermes/plugins/onebot
 ```
 
-然后校验插件能被发现并加载：
+然后校验插件能被发现并加载（`validate` 接的是**目录路径**，不是插件名）：
 
 ```bash
-hermes plugins validate onebot
+hermes plugins validate ~/.hermes/plugins/onebot
 ```
 
 ## NapCat 侧配置
@@ -198,6 +198,11 @@ agent 还通过平台的媒体通道直接发图/语音/视频/文件：本地�
 ## 测试与开发
 
 ```bash
+# 前置：把 hermes-agent 与本仓库 clone 到同级目录
+#   hermes-projects/
+#   ├── hermes-agent/            ← git clone https://github.com/NousResearch/hermes-agent
+#   └── hermes-onebot-adapter/   ← 本仓库
+
 # 单测（hermes 环境 + 插件目录；--no-sync 避免 hermes 依赖被重装）
 cd hermes-onebot-adapter
 PYTHONPATH=../hermes-agent uv run --project ../hermes-agent --no-sync \
