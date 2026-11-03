@@ -38,21 +38,41 @@ QQ 服务器 ⇄ NapCat（你的机器，可与 Hermes 跨机，经 EasyTier 等
 
 ## 安装
 
-把本目录（或其内容）放到 Hermes 的插件目录，**目录名必须是 `onebot`**
-（目录名 = 平台注册名）：
+从 GitHub 安装（推荐；升级一条 `hermes plugins update` 即可）：
+
+```bash
+hermes plugins install rays1d/hermes-onebot-adapter --enable
+```
+
+装完**重启 gateway**——平台适配器不会热物化（插件在 gateway 启动后才 enable 的话，
+平台不会出现在运行中的进程里）：
+
+```bash
+systemctl --user restart hermes-gateway   # 按你的部署方式重启
+```
+
+<details>
+<summary>手动安装（离线 / 开发调试）</summary>
+
+把本仓库内容放进 Hermes 的插件目录即可，**目录名任意**——平台注册名 `onebot`
+来自代码，与目录名、插件名无关：
 
 ```bash
 # 二选一：拷贝或 symlink
-cp -r hermes-onebot-adapter ~/.hermes/plugins/onebot
+cp -r hermes-onebot-adapter ~/.hermes/plugins/onebot-adapter
 # 或
-ln -s /path/to/hermes-onebot-adapter ~/.hermes/plugins/onebot
+ln -s /path/to/hermes-onebot-adapter ~/.hermes/plugins/onebot-adapter
+
+hermes plugins enable onebot-adapter
 ```
 
-然后校验插件能被发现并加载（`validate` 接的是**目录路径**，不是插件名）：
+校验插件能被发现并加载（`validate` 接的是**目录路径**，不是插件名）：
 
 ```bash
-hermes plugins validate ~/.hermes/plugins/onebot
+hermes plugins validate ~/.hermes/plugins/onebot-adapter
 ```
+
+</details>
 
 ## NapCat 侧配置
 

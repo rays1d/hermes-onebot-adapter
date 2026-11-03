@@ -1,8 +1,9 @@
 """hermes-onebot-adapter：Hermes Agent 的 OneBot v11 平台插件（注册入口）。
 
-独立插件目录：把本目录放到 ``~/.hermes/plugins/onebot/``（目录名 = 平台
-注册名）——零 pip 安装、零核心改动。Hermes 发现有 ``plugin.yaml`` 且
-``__init__.py`` 暴露 ``register(ctx)`` 的子目录即加载。
+独立插件目录：``hermes plugins install rays1d/hermes-onebot-adapter``（或把本
+目录放进 ``<hermes-home>/plugins/``，目录名任意——平台注册名 ``onebot`` 来自代码）
+——零 pip 安装、零核心改动。Hermes 发现有 ``plugin.yaml`` 且 ``__init__.py``
+暴露 ``register(ctx)`` 的子目录即加载。
 
 模块布局：
     __init__.py     注册入口（本文件）+ 配置探针
@@ -169,7 +170,7 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=["ONEBOT_TOKEN"],
         install_hint=(
-            "Place this plugin directory at ~/.hermes/plugins/onebot/ (aiohttp ships "
+            "Install this plugin into <hermes-home>/plugins/ (aiohttp ships "
             "with hermes — no extra deps), set ONEBOT_TOKEN to the access token of "
             "the WebSocket-client (reverse WS) item in your OneBot implementation "
             "(NapCat), and point that client at ws://<hermes-host>:8643/onebot/ws."

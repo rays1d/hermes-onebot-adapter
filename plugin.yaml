@@ -1,7 +1,7 @@
-name: onebot-platform
+name: onebot-adapter
 label: OneBot (QQ)
 kind: platform
-version: 0.1.1
+version: 0.1.2
 # 平台插件默认延迟加载；不声明 provides_tools 时，CLI/TUI 进程（不物化平台）
 # 不会运行 register()，onebot_call 工具在非 gateway 会话中完全缺失（#78050 语义）。
 # 声明后 loader 会从 tools.py 预注册客户端工具（要求 tools.py 有 register_tools(ctx)）。
