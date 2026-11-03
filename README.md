@@ -51,6 +51,12 @@ hermes plugins install rays1d/hermes-onebot-adapter --enable
 systemctl --user restart hermes-gateway   # 按你的部署方式重启
 ```
 
+> **首次安装会有安全扫描提示（caution）**：Hermes 的安装扫描会把本仓库 README /
+> `plugin.yaml` / 测试夹具里的**说明性文字**——如 `0.0.0.0`、`http://…`、`uv run
+> --project`——当成网络/供应链风险（实测 14 条均来自文本，`.py` 代码零命中）。
+> 交互式终端确认继续即可；无 tty 的自动化安装（SSH / CI）加 `--force` 接受该判定：
+> `hermes plugins install rays1d/hermes-onebot-adapter --enable --force`
+
 <details>
 <summary>手动安装（离线 / 开发调试）</summary>
 
