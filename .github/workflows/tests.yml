@@ -54,6 +54,10 @@ jobs:
         working-directory: hermes-onebot-adapter
         env:
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
+        # aiohttp 是插件自身的运行依赖（适配器 + 测试 harness 都用它），但宿主
+        # 把它放在 messaging extra 里——全量 sync 那个 extra 会拖进 telegram/discord
+        # 一堆无关包，所以这里单独 --with，沿用宿主同一个 CVE pin。
         run: >-
           uv run --project ../hermes-agent --no-sync
+          --with aiohttp==3.14.5
           python -m pytest tests/ -q
