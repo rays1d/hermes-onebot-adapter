@@ -1,5 +1,7 @@
 # hermes-onebot-adapter
 
+[![tests](https://github.com/rays1d/hermes-onebot-adapter/actions/workflows/tests.yml/badge.svg)](https://github.com/rays1d/hermes-onebot-adapter/actions/workflows/tests.yml)
+
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 OneBot v11 (QQ) 平台插件。
 
 通过 OneBot v11 反向 WebSocket 对接你自有的 NapCat 实例（或其他 OneBot 11 实现端：
