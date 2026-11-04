@@ -38,7 +38,9 @@ jobs:
           fetch-depth: 1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        # setup-uv 只发精确版本 tag（没有浮动的大版本 v10），必须写全 vX.Y.Z；
+        # 上游发新版时手动 bump。
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
