@@ -2,12 +2,12 @@ name: tests
 
 # 单元测试跑在「插件 + hermes-agent（宿主框架）」两个仓库的组合上：
 # 插件依赖宿主注入的 gateway.* 模块，所以每次都要拉一份 hermes-agent。
-# hermes-agent 的 pyproject 只支持 3.14 运行时（uv.lock 亦然），故 --python 3.14。
 #
-# 依赖刻意**不**同步 hermes-agent 的 356 包全量环境：测试只 import 少量
-# gateway.* 模块，三个显式 pin 的包（pytest / pytest-asyncio / aiohttp）足够，
-# 冷启动从分钟级压到秒级。三个 pin 与 hermes-agent 当前 pyproject 的版本一致——
-# 上游 bump 时这里可以不动（旧 pin 仍可用），改了记得同步。
+# 测试环境直接用 hermes-agent 自己的 venv（uv sync，含 dev 组的 pytest）：
+# 插件 import 的是宿主的 gateway.*，依赖面由宿主的 uv.lock 决定，自己再维护
+# 一份「最小包列表」会随宿主内部 import 变化而静默失效（实测：curated
+# 三包环境在 Linux 缺 ruamel.yaml，`gateway.platforms.base` → utils → hermes_yaml
+# 一链就断）。代价是 CI 多一次宿主全量 sync（uv cache 命中后十几秒）。
 on:
   push:
     branches: [main]
@@ -44,13 +44,16 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Sync hermes-agent environment
+        working-directory: hermes-agent
+        # hermes-agent 的 [tool.uv] default-groups = []，plain uv sync 不装 dev 组
+        # （pytest/pytest-asyncio 在 dev 里），必须显式 --group dev。
+        run: uv sync --group dev
+
       - name: Run tests
         working-directory: hermes-onebot-adapter
         env:
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
         run: >-
-          uv run --python 3.14
-          --with pytest==9.1.1
-          --with pytest-asyncio==1.4.0
-          --with aiohttp==3.14.5
+          uv run --project ../hermes-agent --no-sync
           python -m pytest tests/ -q
