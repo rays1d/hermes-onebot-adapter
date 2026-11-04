@@ -1,7 +1,7 @@
 name: onebot-adapter
 label: OneBot (QQ)
 kind: platform
-version: 0.1.2
+version: 0.1.3
 # 平台插件默认延迟加载；不声明 provides_tools 时，CLI/TUI 进程（不物化平台）
 # 不会运行 register()，onebot_call 工具在非 gateway 会话中完全缺失（#78050 语义）。
 # 声明后 loader 会从 tools.py 预注册客户端工具（要求 tools.py 有 register_tools(ctx)）。
@@ -77,4 +77,12 @@ optional_env:
   - name: ONEBOT_MAX_MSG_CHARS
     description: "Outbound messages longer than this many characters are split at sentence boundaries (default 2000)"
     prompt: "Max chars per outbound message (default 2000)"
+    password: false
+  - name: ONEBOT_STRIP_TAGS
+    description: "Strip a leading '§N§ ' context tag from each outbound line (default false). Turn on when a context engine persists those numbering prefixes into replies and they leak into QQ"
+    prompt: "Strip leading context tags (§N§)? (true/false)"
+    password: false
+  - name: ONEBOT_STRIP_PREFIXES
+    description: "Comma-separated literal prefixes stripped from the start of each outbound line (default empty); literal only, never interpreted as regex, never applied mid-line"
+    prompt: "Literal line-start prefixes to strip (comma-separated)"
     password: false

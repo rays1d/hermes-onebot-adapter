@@ -612,6 +612,27 @@ class TestStandaloneSend:
             assert joined == text
 
     @pytest.mark.asyncio
+    async def test_outbound_strip_tags_applies(self, monkeypatch, no_chunk_delay):
+        """standalone 与 live adapter 同一套出站转换（配置键一致）。"""
+        async with running_http_api() as (api, base_url):
+            monkeypatch.setenv("ONEBOT_HTTP_URL", base_url)
+            result = await standalone_mod._standalone_send(
+                _pconfig(outbound_strip_tags=True), OTHER_USER, "§3§ 定时提醒")
+            assert result["success"] is True
+            req = api.request_for("send_private_msg")
+            assert req["body"]["message"] == [
+                {"type": "text", "data": {"text": "定时提醒"}}]
+
+    @pytest.mark.asyncio
+    async def test_outbound_transform_default_off(self, monkeypatch, no_chunk_delay):
+        """默认关闭：`§N§` 原样投递，与历史行为逐字节一致。"""
+        async with running_http_api() as (api, base_url):
+            monkeypatch.setenv("ONEBOT_HTTP_URL", base_url)
+            await standalone_mod._standalone_send(_pconfig(), OTHER_USER, "§3§ 定时提醒")
+            req = api.request_for("send_private_msg")
+            assert req["body"]["message"][0]["data"]["text"] == "§3§ 定时提醒"
+
+    @pytest.mark.asyncio
     async def test_missing_http_url_reports_error(self, monkeypatch):
         monkeypatch.delenv("ONEBOT_HTTP_URL", raising=False)
         result = await standalone_mod._standalone_send(_pconfig(), OTHER_USER, "hi")

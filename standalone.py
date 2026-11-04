@@ -10,6 +10,7 @@ NapCat 侧启用 HTTP server，插件经 ``ONEBOT_HTTP_URL``（或 config.yaml
 ``thread_id`` / ``media_files`` / ``force_document`` 仅为签名平价接受：
 standalone HTTP 路径只投递纯文本（媒体走 live adapter 的出站全家）。
 分段复用 :func:`formatting.split_for_qq`（句边界，默认 2000 字符），
+逐段过 :mod:`.outbound` 出站转换（默认关闭，与 live adapter 同一套配置键），
 段间 0.3s 间隔与 adapter 一致，缓解个人号高频发送风控。
 """
 
@@ -19,11 +20,13 @@ import logging
 from typing import Any, Optional
 
 from gateway.platforms._shared import (
+    extra_or_secret as _extra_or_secret,
     get_scoped_secret as _get_scoped_secret,
     send_error,
 )
 
 from .formatting import QQ_TEXT_LIMIT, split_for_qq, strip_markdown
+from .outbound import parse_rules as _parse_outbound_rules
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +90,14 @@ async def _standalone_send(
         headers["Authorization"] = f"Bearer {token}"
 
     chunks = split_for_qq(strip_markdown(message or ""), QQ_TEXT_LIMIT)
+    rules = _parse_outbound_rules(
+        _extra_or_secret(extra, "outbound_strip_tags", "ONEBOT_STRIP_TAGS", ""),
+        _extra_or_secret(extra, "outbound_strip_prefixes", "ONEBOT_STRIP_PREFIXES", ""),
+    )
+    if not rules.is_noop:
+        chunks = [c for c in (rules.apply(chunk) for chunk in chunks) if c.strip()]
     if not chunks:
-        return send_error("OneBot standalone send: empty message after markdown stripping")
+        return send_error("OneBot standalone send: empty message after outbound formatting")
 
     last_id: Optional[str] = None
     try:

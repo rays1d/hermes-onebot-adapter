@@ -58,6 +58,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator
 
 from .formatting import QQ_TEXT_LIMIT, split_for_qq, strip_markdown
+from .outbound import parse_rules as _parse_outbound_rules
 from .segments import (
     MediaRef,
     MediaRegistry,
@@ -248,6 +249,10 @@ class OnebotAdapter(BasePlatformAdapter):
         admin_users (ONEBOT_ADMIN_USERS)      管理员档（危险动作放行）
         allow_all (ONEBOT_ALLOW_ALL_USERS)    一键放开兜底
         max_msg_chars (ONEBOT_MAX_MSG_CHARS)  出站分段阈值，默认 2000
+        outbound_strip_tags (ONEBOT_STRIP_TAGS)
+                                             剥行首 ``§N§`` 编号前缀，默认 false
+        outbound_strip_prefixes (ONEBOT_STRIP_PREFIXES)
+                                             逗号分隔的行首字面量前缀，默认空
     """
 
     SUPPORTS_MESSAGE_EDITING = False  # OneBot 11 无编辑消息动作
@@ -307,6 +312,12 @@ class OnebotAdapter(BasePlatformAdapter):
             self._max_msg_chars = DEFAULT_MAX_MSG_CHARS
         if self._max_msg_chars <= 0:
             self._max_msg_chars = DEFAULT_MAX_MSG_CHARS
+
+        # ── 出站文本转换（默认全关：关闭时与历史输出逐字节一致）──
+        self._outbound_rules = _parse_outbound_rules(
+            _extra_or_secret(extra, "outbound_strip_tags", "ONEBOT_STRIP_TAGS", ""),
+            _extra_or_secret(extra, "outbound_strip_prefixes", "ONEBOT_STRIP_PREFIXES", ""),
+        )
 
         # ── 运行时状态 ──
         self._runner: Optional["web.AppRunner"] = None  # type: ignore[name-defined]
@@ -1084,11 +1095,15 @@ class OnebotAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        """发文本：markdown 剥离 → 句边界分段 → 逐段发送（段间 0.3s 防风控）。
+        """发文本：markdown 剥离 → 句边界分段 → 逐段出站转换 → 逐段发送。
+
+        段间 0.3s 防风控。出站转换（:mod:`.outbound`）作用在**分段之后的最终
+        文本**上，不改变分段边界；转换后变空的段直接跳过不发。
 
         部分失败语义：第 N>1 段失败时，已发段落不可重发——返回 ``retryable=False``
         的失败结果（``message_id``=最后成功段，其余已发段 id 进
-        ``continuation_message_ids``）；首段失败则原样透传（retryable 不改）。
+        ``continuation_message_ids``）；首个**实际发出**的段失败则原样透传
+        （retryable 不改，引用仍挂在真正的第一条上）。
         """
         del metadata
         chat_type, target = self._resolve_chat_target(chat_id)
@@ -1097,25 +1112,30 @@ class OnebotAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         chunks = split_for_qq(text, self._max_msg_chars)
+        if not self._outbound_rules.is_noop:
+            chunks = [c for c in (self._outbound_rules.apply(chunk) for chunk in chunks)
+                      if c.strip()]
         if not chunks:
             return SendResult(success=True)
 
         message_ids: list[str] = []
         last: Optional[SendResult] = None
+        sent_any = False
         for idx, chunk in enumerate(chunks):
             last = await self._send_message_segments(
                 chat_type, target, [{"type": "text", "data": {"text": chunk}}],
-                reply_to=reply_to if idx == 0 else None)
+                reply_to=None if sent_any else reply_to)
             if not last.success:
-                if idx == 0:
-                    return last  # 首段即失败：未发出任何段，重试语义原样透传
-                # 已成功发出 idx 段——整体重试会重复这些段 → 强制不可重试；
+                if not sent_any:
+                    return last  # 未发出任何段：重试语义原样透传
+                # 已成功发出若干段——整体重试会重复这些段 → 强制不可重试；
                 # 末段 id 留在 message_id（后续编辑/引用对准最新一条），其余进 continuation
                 return dataclasses.replace(
                     last,
                     message_id=message_ids[-1] if message_ids else None,
                     retryable=False,
                     continuation_message_ids=tuple(message_ids[:-1]))
+            sent_any = True
             if last.message_id:
                 message_ids.append(last.message_id)
             if idx < len(chunks) - 1:

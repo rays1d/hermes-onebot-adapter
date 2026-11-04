@@ -117,6 +117,8 @@ hermes plugins validate ~/.hermes/plugins/onebot-adapter
 | `ONEBOT_ADMIN_USERS` | | — | 管理员 QQ 号（解锁群管理等危险 action）|
 | `ONEBOT_ALLOW_ALL_USERS` | | `false` | 一键放开（fail-open，仅限可信环境）|
 | `ONEBOT_MAX_MSG_CHARS` | | `2000` | 出站单条消息分段阈值 |
+| `ONEBOT_STRIP_TAGS` | | `false` | 剥行首 `§N§` 编号前缀（见下「出站文本转换」）|
+| `ONEBOT_STRIP_PREFIXES` | | — | 逗号分隔的行首字面量前缀（纯字面量，不解释为正则）|
 
 也可以不用 env，写在 `~/.hermes/config.yaml` 的 `platforms.onebot.*` 下（env 优先）：
 
@@ -134,6 +136,8 @@ platforms:
     allowed_groups: "123456,234567"
     admin_users: "10001"
     max_msg_chars: 2000
+    outbound_strip_tags: true        # 等价 ONEBOT_STRIP_TAGS=true
+    outbound_strip_prefixes: ""      # 等价 ONEBOT_STRIP_PREFIXES
 ```
 
 `hermes gateway status` 显示平台已连接（等 NapCat 拨入后）、`hermes gateway run`
@@ -188,6 +192,34 @@ agent 需要时用 `onebot_call` 把 `media_id` 传给 get_image / get_record / 
 agent 还通过平台的媒体通道直接发图/语音/视频/文件：本地大文件优先走
 `upload_file_stream` 流式上传（NapCat ≥ 4.8.115），探测失败自动回退 base64
 （媒体段）或 `file://` 直传（文件动作，需与 NapCat 同机可见）。
+
+## 出站文本转换
+
+QQ 侧可见的文本在「分段完成、组装成 text 段之前」会过一层最小清洗，规则全部
+可配置、**默认全关**（关闭时输出与历史行为逐字节一致）：
+
+| 配置（env）| 默认 | 作用 |
+|---|---|---|
+| `outbound_strip_tags`（`ONEBOT_STRIP_TAGS`）| `false` | 剥掉每行**行首**的 `§N§` 编号前缀（连其后至多一个空格）|
+| `outbound_strip_prefixes`（`ONEBOT_STRIP_PREFIXES`）| 空 | 逗号分隔的**字面量**前缀，逐行行首剥（可叠加），同样吃掉其后至多一个空格 |
+
+边界钉死，不做通用改写网关：
+
+- **只锚定行首**——行中间出现同一串字面量绝不误伤（`看看 §12§ 这个` 原样保留）；
+- **`§N§` 必须带定界符**——裸数字行首（`12 个苹果`、`2024 年`、`1. 第一项`）不会被吞；
+- **配置只写字面量**——永不编译成正则，写 `(草稿)` 就只匹配 `(草稿)`；
+- 只作用于 `send` / standalone（cron）投递的显示文本，不动入库、工具链路与
+  分段边界；`onebot_call` 直通动作（`send_msg` 等）参数原样转发，不经转换。
+
+```yaml
+platforms:
+  onebot:
+    outbound_strip_tags: true                 # 打开 §N§ 剥离
+    outbound_strip_prefixes: "[BOT],(草稿)"   # 额外的行首字面量前缀
+```
+
+典型场景：Hermes Context Engine 会把 `§N§` 回收编号当回复前缀原样持久化，
+CLI/gateway 显示可以接受，QQ 聊天则需要打开 `outbound_strip_tags` 保持观感。
 
 ## 故障排查
 
